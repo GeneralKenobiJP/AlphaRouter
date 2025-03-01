@@ -1,3 +1,4 @@
+import math
 from typing import Set
 
 import networkx as nx
@@ -24,6 +25,28 @@ def render_rgb(env):
     plt.imshow(env.render())
     plt.axis("off")
     plt.show()
+
+
+class PositionalEncoding(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+        position = torch.arange(LOOKAHEAD_LENGTH).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, EMBEDDING_DIM + 1, 2) * (-math.log(10000.0) / EMBEDDING_DIM))
+        pe = torch.zeros(LOOKAHEAD_LENGTH, EMBEDDING_DIM + 1)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[::(EMBEDDING_DIM // 2) * 2])
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Arguments:
+            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+        """
+        print(f'shape x: {x.shape}, shape pe: {self.pe.shape}')
+        x = x + self.pe[:x.size(0)]
+        return x
 
 class AlphaRouterAgent:
     def __init__(self, env: Routing):
@@ -120,6 +143,11 @@ if __name__ == '__main__':
     node_embedding = model.embed_nodes()
     print(node_embedding.shape)
     print(node_embedding)
+
+    positional_encoding = PositionalEncoding()
+    context_encoding = positional_encoding.forward(node_embedding)
+    print(context_encoding)
+
     # model.learn(1e2)
 
     # model = PPO("MultiInputPolicy", env, verbose=1)
