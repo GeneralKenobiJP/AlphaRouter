@@ -48,6 +48,42 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:x.size(0)]
         return x
 
+class TransformerLayer(nn.Module):
+    def __init__(self, embedding_dim, num_heads, feedforward_dim):
+        super().__init__()
+        if embedding_dim % num_heads != 0:
+            # Increase the dimension to a multiple of heads
+            padded_embedding_dim = (embedding_dim // num_heads + 1) * num_heads
+            self.padding_dim = padded_embedding_dim - embedding_dim
+            embedding_dim = padded_embedding_dim
+        else:
+            self.padding_dim = 0
+        self.embedding_dim = embedding_dim
+        self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(embedding_dim)
+        # self.dropout1 = nn.Dropout()
+        self.ffn = nn.Sequential(
+            nn.Linear(embedding_dim, feedforward_dim),
+            nn.ReLU(),
+            nn.Linear(feedforward_dim, embedding_dim)
+        )
+        self.norm2 = nn.LayerNorm(embedding_dim)
+
+    def forward(self, x):
+        if self.padding_dim > 0:
+            print(f'pre-padding x shape: {x.shape}')
+            print(f'embedding_dim: {self.embedding_dim}')
+            print(f'padding_dim: {self.padding_dim}')
+            x = nn.functional.pad(x, (0, self.padding_dim), value=0)
+            print(f'padded x shape: {x.shape}')
+            print(f'padded x: {x}')
+
+        attention_output, _ = self.multihead_attention(x, x, x)
+        x = self.norm1(x + attention_output)
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + ffn_output)
+        return x
+
 class AlphaRouterAgent:
     def __init__(self, env: Routing):
         self.env = env
@@ -147,6 +183,10 @@ if __name__ == '__main__':
     positional_encoding = PositionalEncoding()
     context_encoding = positional_encoding.forward(node_embedding)
     print(context_encoding)
+
+    transformer_layer = TransformerLayer((EMBEDDING_DIM + 1), 6, EMBEDDING_DIM + 1)
+    transformer_layer_output = transformer_layer.forward(context_encoding)
+    print(transformer_layer_output)
 
     # model.learn(1e2)
 
