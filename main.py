@@ -56,14 +56,14 @@ class PositionalEncoding(nn.Module):
 class TransformerLayer(nn.Module):
     def __init__(self, embedding_dim, num_heads, ffn_dim):
         super().__init__()
-        if embedding_dim % num_heads != 0:
-            # Increase the dimension to a multiple of heads
-            padded_embedding_dim = (embedding_dim // num_heads + 1) * num_heads
-            self.padding_dim = padded_embedding_dim - embedding_dim
-            embedding_dim = padded_embedding_dim
-        else:
-            self.padding_dim = 0
-        self.embedding_dim = embedding_dim
+        # if embedding_dim % num_heads != 0:
+        #     # Increase the dimension to a multiple of heads
+        #     padded_embedding_dim = (embedding_dim // num_heads + 1) * num_heads
+        #     self.padding_dim = padded_embedding_dim - embedding_dim
+        #     embedding_dim = padded_embedding_dim
+        # else:
+        #     self.padding_dim = 0
+        # self.embedding_dim = embedding_dim
         self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
         self.norm1 = nn.LayerNorm(embedding_dim)
         # self.dropout1 = nn.Dropout()
@@ -75,11 +75,11 @@ class TransformerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(embedding_dim)
 
     def forward(self, x):
-        if self.padding_dim > 0:
+        # if self.padding_dim > 0:
             # print(f'pre-padding x shape: {x.shape}')
             # print(f'embedding_dim: {self.embedding_dim}')
             # print(f'padding_dim: {self.padding_dim}')
-            x = nn.functional.pad(x, (0, self.padding_dim), value=0)
+            # x = nn.functional.pad(x, (0, self.padding_dim), value=0)
             # print(f'padded x shape: {x.shape}')
             # print(f'padded x: {x}')
 
@@ -90,7 +90,7 @@ class TransformerLayer(nn.Module):
         return x
 
 class Transformer(nn.Module):
-    def __init__(self, embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length):
+    def __init__(self, embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length, swap_options):
         super().__init__()
         self.positional_encoding = PositionalEncoding(embedding_dim, lookahead_length)
 
@@ -107,6 +107,7 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleList([
             TransformerLayer(embedding_dim, num_heads, ffn_dim) for _ in range(num_layers)
         ])
+        self.decoder = nn.Linear(embedding_dim, swap_options)
 
     def forward(self, x):
         x = self.positional_encoding(x)
@@ -123,17 +124,18 @@ class Transformer(nn.Module):
             print(f'Iteration: {i}')
             i+=1
             x = layer(x)
-        return x
+        return self.decoder.forward(x)
 
 class AlphaRouterAgent:
-    def __init__(self, env: Routing):
+    def __init__(self, env: Routing, embedding_dim: int = 20, num_heads: int = 6, ffn_dim: int = 64, num_layers: int = 4, lookahead_length: int = 48):
         self.env = env
-        # self.env.rewarder = BasicRewarder(illegal_action_penalty=0, penalty_per_swap=-1, reward_per_surpass=0)
         self.env.rewarder = BasicRewarder()
         self.reward = 0
         self.episode_limit = 100
         self.success_count = 0
         self.qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(), embedding_dim=EMBEDDING_DIM)
+        self.transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length, len(connection_graph.edges) + 1)
+        self.softmax = nn.Softmax(dim=0)
 
     def learn(self, total_timesteps: int):
         for i in range(int(total_timesteps)):
@@ -166,8 +168,28 @@ class AlphaRouterAgent:
 
     def get_action(self, env: Routing) -> int:
         node_embedding = self.embed_nodes()
+        transformer_output = self.transformer.forward(node_embedding)
+        # softmax_output = self.softmax.forward(transformer_output)
+        # action = softmax_output.argmax(dim=0)
+        swap_scores = transformer_output.sum(dim=0)
+        softmax_output = self.softmax(swap_scores)
 
-        return env.action_space.sample()
+        action = softmax_output.argmax(dim=0)
+
+        print(f'Transformer output: {transformer_output}')
+        print(f'Transformer output shape: {transformer_output.shape}')
+        print(f'Swap scores: {swap_scores}')
+        print(f'Swap scores shape: {swap_scores.shape}')
+        print(f'Softmax output: {softmax_output}')
+        print(f'Softmax output shape: {softmax_output.shape}')
+        print(f'Action: {action}')
+        print(f'Intified action: {int(action)}')
+
+        return int(action)
+
+        # print(f'sample: {env.action_space.sample()}')
+
+        # return env.action_space.sample()
 
     def embed_nodes(self):
         state: RoutingState = self.env._state
@@ -225,15 +247,15 @@ if __name__ == '__main__':
     context_encoding = positional_encoding.forward(node_embedding)
     print(context_encoding)
 
-    transformer_layer = TransformerLayer((EMBEDDING_DIM + 1), 6, EMBEDDING_DIM + 1)
-    transformer_layer_output = transformer_layer.forward(context_encoding)
-    print(transformer_layer_output)
+    # transformer_layer = TransformerLayer((EMBEDDING_DIM + 1), 6, EMBEDDING_DIM + 1)
+    # transformer_layer_output = transformer_layer.forward(context_encoding)
+    # print(transformer_layer_output)
 
-    transformer = Transformer(EMBEDDING_DIM, NUM_HEADS, FFN_DIM, NUM_LAYERS, LOOKAHEAD_LENGTH)
-    transformer_output = transformer.forward(node_embedding)
-    print(transformer_output)
+    # transformer = Transformer(EMBEDDING_DIM, NUM_HEADS, FFN_DIM, NUM_LAYERS, LOOKAHEAD_LENGTH)
+    # transformer_output = transformer.forward(node_embedding)
+    # print(transformer_output)
 
-    # model.learn(1e2)
+    model.learn(1e3)
 
     # model = PPO("MultiInputPolicy", env, verbose=1)
     # model.learn(int(1e3))
