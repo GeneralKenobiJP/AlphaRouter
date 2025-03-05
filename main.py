@@ -1,4 +1,5 @@
 import math
+from typing import List, Set
 
 import networkx as nx
 import torch
@@ -194,6 +195,11 @@ class AlphaRouterAgent:
         """
         # Generate a new interaction circuit
         self.env.reset()
+        render_rgb(self.env)
+
+        state: RoutingState = self.env._state
+        interaction_circuit = state.interaction_circuit[:self.lookahead_length]
+        print(f'interaction_circuit: {interaction_circuit}')
 
         for _ in range(self.episode_limit):
             # print(state.mapping)
@@ -221,6 +227,7 @@ class AlphaRouterAgent:
 
         action = softmax_output.argmax(dim=0)
 
+        print(f'Node embedding: {node_embedding}')
         print(f'Transformer output: {transformer_output}')
         print(f'Transformer output shape: {transformer_output.shape}')
         print(f'Swap scores: {swap_scores}')
@@ -256,20 +263,32 @@ class AlphaRouterAgent:
         interaction_circuit = state.interaction_circuit[:self.lookahead_length]  # Limit lookahead depth
 
         feature_matrix = []
-        for depth, (logical_q1, logical_q2) in enumerate(interaction_circuit):
+        qubit_gate_dependencies: List[Set[int]] = []
+        for _ in range(state.n_qubits):
+            qubit_gate_dependencies.append(set())
+
+        for idx, (logical_q1, logical_q2) in enumerate(interaction_circuit):
             physical_q1 = state.mapping[logical_q1]
             physical_q2 = state.mapping[logical_q2]
 
             embedding_q1 = self.qubit_embedding(torch.tensor(physical_q1))
             embedding_q2 = self.qubit_embedding(torch.tensor(physical_q2))
 
+            gate_dependencies = qubit_gate_dependencies[logical_q1].union(qubit_gate_dependencies[logical_q2])
+            depth = len(gate_dependencies) + 1
+
             gate_vector = (embedding_q1 + embedding_q2) / 2  # Mean of qubit encodings
             gate_vector = nn.functional.pad(gate_vector, (0, 1), value=depth)  # Append depth
+
+            qubit_gate_dependencies[logical_q1].add(idx)
+            qubit_gate_dependencies[logical_q2].add(idx)
 
             feature_matrix.append(gate_vector)
 
         if len(feature_matrix) == 0:
             return torch.zeros((LOOKAHEAD_LENGTH, EMBEDDING_DIM + 1))
+
+        print(f'Qubit dependencies: {qubit_gate_dependencies}')
 
         return torch.stack(feature_matrix)
 
@@ -288,10 +307,10 @@ if __name__ == '__main__':
         connection_graph=connection_graph,
         render_mode="rgb_array"
     )
-    action_space = env.action_space
-    observation_space = env.observation_space
-    print(action_space)
-    print(observation_space)
+    # action_space = env.action_space
+    # observation_space = env.observation_space
+    # print(action_space)
+    # print(observation_space)
 
     model = AlphaRouterAgent(env)
     state: RoutingState = model.env._state
@@ -312,7 +331,7 @@ if __name__ == '__main__':
     # transformer_output = transformer.forward(node_embedding)
     # print(transformer_output)
 
-    model.learn(1e3)
+    model.learn(1e0)
 
     # model = PPO("MultiInputPolicy", env, verbose=1)
     # model.learn(int(1e3))
