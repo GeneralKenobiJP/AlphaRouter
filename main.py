@@ -19,7 +19,7 @@ EMBEDDING_DIM = 20      # AR paper embedding dimension
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length
 NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
-FFN_DIM = 64            # Default hidden layer dimensionality of ffn in transformer
+FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
 
 def render_rgb(env):
     """Convenience method that we will use later on to display our results. Copied from notebooks"""
@@ -225,7 +225,7 @@ class AlphaRouterAgent:
         swap_scores = transformer_output.sum(dim=0)
         softmax_output = self.softmax(swap_scores)
 
-        action = softmax_output.argmax(dim=0)
+        action = torch.multinomial(softmax_output, 1)
 
         print(f'Node embedding: {node_embedding}')
         print(f'Transformer output: {transformer_output}')
@@ -238,10 +238,6 @@ class AlphaRouterAgent:
         print(f'Intified action: {int(action)}')
 
         return int(action)
-
-        # print(f'sample: {env.action_space.sample()}')
-
-        # return env.action_space.sample()
 
     def embed_nodes(self):
         """
