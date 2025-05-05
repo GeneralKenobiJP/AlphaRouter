@@ -1,18 +1,14 @@
 import math
-from typing import List, Set
+from collections import deque
+from typing import List, Set, Union
 
 import networkx as nx
 import torch
-from gymnasium import Env
-from numpy import ndarray
-# import qgym
 from qgym.envs import InitialMapping, Routing
 from qgym.envs.routing import BasicRewarder, RoutingState
-from qgym.generators import BasicGraphGenerator
 import matplotlib.pyplot as plt
-from stable_baselines3 import PPO
 import random
-from time import sleep
+
 from torch import nn
 
 EMBEDDING_DIM = 20      # AR paper embedding dimension
@@ -154,10 +150,67 @@ class Transformer(nn.Module):
             x = layer(x)
         return self.decoder.forward(x)
 
+class ReplayBuffer:
+    """
+    A simple replay buffer for standard RL:
+      - stores transitions (state, action, reward, next_state, done)
+      - samples minibatches of transitions as tensors
+    """
+    def __init__(self, capacity: int, device: torch.device):
+        """
+        :param capacity: maximum number of transitions to store
+        :param device:   torch.device to which sampled batches will be moved
+        """
+        self.capacity = capacity
+        self.device   = device
+        self.buffer   = deque(maxlen=capacity)
+
+    def store(self,
+              state: torch.Tensor,
+              action: Union[int, torch.Tensor],
+              reward: float,
+              next_state: torch.Tensor,
+              done: bool):
+        """
+        Stores an experience.
+        We detach and move everything to CPU to avoid pinning GPU memory.
+        """
+        # ensure everything is on CPU and detached
+        stored_state = state.detach().cpu()
+        stored_action = (action.detach().cpu() if isinstance(action, torch.Tensor)
+              else torch.tensor(action, dtype=torch.long))
+        stored_reward = torch.tensor(reward, dtype=torch.float32)
+        stored_next_state = next_state.detach().cpu()
+        stored_done = torch.tensor(done, dtype=torch.float32)
+        self.buffer.append((stored_state, stored_action, stored_reward, stored_next_state, stored_done))
+
+    def sample(self, batch_size: int):
+        """
+        Samples a batch of transitions, returning:
+            states:     float32 tensor (B, *state_shape)
+            actions:    long    tensor (B,)
+            rewards:    float32 tensor (B,)
+            next_states float32 tensor (B, *state_shape)
+            dones:      float32 tensor (B,)
+        all moved to self.device.
+        """
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+
+        states = torch.stack(states, dim=0).to(self.device)
+        actions = torch.stack(actions, dim=0).to(self.device)
+        rewards = torch.stack(rewards, dim=0).to(self.device)
+        next_states = torch.stack(next_states, dim=0).to(self.device)
+        dones = torch.stack(dones, dim=0).to(self.device)
+
+        return states, actions, rewards, next_states, dones
+
+    def __len__(self):
+        return len(self.buffer)
 
 class AlphaRouterAgent:
     """The AlphaRouter routing agent"""
-    def __init__(self, env: Routing, embedding_dim: int = 20, num_heads: int = 6, ffn_dim: int = 64, num_layers: int = 4, lookahead_length: int = 48):
+    def __init__(self, env: Routing, embedding_dim: int = 20, num_heads: int = 6, ffn_dim: int = 64, num_layers: int = 4, lookahead_length: int = 48, buffer_size: int = int(1e6), gpu: bool = True):
         """
         :param env: Particular routing environment we want to apply the agent to
         :param embedding_dim: Embedding dimension of the node embeddings (not including depth embedding)
@@ -177,6 +230,11 @@ class AlphaRouterAgent:
         self.qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(), embedding_dim=embedding_dim)
         self.transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length, swap_options=len(connection_graph.edges) + 1)
         self.softmax = nn.Softmax(dim=0)
+        device = torch.device("cuda" if torch.cuda.is_available() and gpu else "cpu")
+        self.replay_buffer = ReplayBuffer(
+            buffer_size,
+            device
+        )
 
     def learn(self, total_timesteps: int):
         """
@@ -203,22 +261,24 @@ class AlphaRouterAgent:
 
         for _ in range(self.episode_limit):
             # print(state.mapping)
-            action = self.get_action(self.env)
+            state_embedding = self.embed_nodes()
+            action = self.get_action(state_embedding)
             observation, reward, done, truncated, info = self.env.step(action)
+            self.replay_buffer.store(state_embedding, action, reward, self.embed_nodes(), done)
             # render_rgb(self.env)
             # self.env.render()
             # sleep(1)
+            print(f'REPLAY BUFFER SAMPLE: {self.replay_buffer.sample(1)}')
             if done:
                 self.success_count += 1
                 break
 
-    def get_action(self, env: Routing) -> int:
+    def get_action(self, node_embedding) -> int:
         """
         Based on the current environment state, get an action suggested by the agent
-        :param env: Routing environment
+        :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
         :return: Action - index of the swap option (last option is no swap)
         """
-        node_embedding = self.embed_nodes()
         transformer_output = self.transformer.forward(node_embedding)
         # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
         # as we want to output the optimal swap action
