@@ -1,15 +1,21 @@
 import math
 from collections import deque
-from typing import List, Set, Union
+from typing import List, Set, Union, Any
 
 import networkx as nx
+import numpy as np
 import torch
+from numpy import ndarray, dtype
 from qgym.envs import InitialMapping, Routing
 from qgym.envs.routing import BasicRewarder, RoutingState
 import matplotlib.pyplot as plt
 import random
 
-from torch import nn
+from torch import nn, Tensor
+
+from torchviz import make_dot
+
+from custom_interaction_generator import CustomInteractionGenerator
 
 EMBEDDING_DIM = 20      # AR paper embedding dimension
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length
@@ -53,7 +59,7 @@ class PositionalEncoding(nn.Module):
         Applies the positional encoding
         :param x: input tensor
         """
-        print(f'shape x: {x.shape}, shape pe: {self.pe.shape}')
+        # print(f'shape x: {x.shape}, shape pe: {self.pe.shape}')
         x = x + self.pe[:x.size(0)]
         return x
 
@@ -74,7 +80,8 @@ class TransformerLayer(nn.Module):
         """
         super().__init__()
 
-        self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
+        # self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
+        self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads)
         self.norm1 = nn.LayerNorm(embedding_dim)
         # self.dropout1 = nn.Dropout()
         self.ffn = nn.Sequential(
@@ -220,10 +227,11 @@ class AlphaRouterAgent:
         :param lookahead_length: The maximal number of the gates ahead that we will analyze
         """
         self.env = env
-        self.env.rewarder = BasicRewarder()
+        self.env.rewarder = ManhattanRewarder()
         self.reward = 0
         self.episode_limit = 100  # The maximal number of steps in a single episode
-        self.success_count = 0  # How many times did we achieved a successful routing during the learning process
+        self.success_count = 0  # How many times did we achieve a successful routing during the learning process
+        self.loss_sum = 0
         self.lookahead_length = lookahead_length
         state: RoutingState = self.env._state
         connection_graph = state.connection_graph
@@ -236,6 +244,34 @@ class AlphaRouterAgent:
             device
         )
 
+        # self.initial_mapping = state.mapping
+        # def manhattan_loss(q0_physical: int, q1_physical: int) -> torch.Tensor:
+        #     # return torch.tensor(np.sum(np.abs(mapping - self.initial_mapping)), dtype=float, requires_grad=True, device=device)
+        #     # print(f"q0_physical: {q0_physical}")
+        #     # print(f"q1_physical: {q1_physical}")
+        #     return torch.tensor(np.abs(q1_physical - q0_physical), dtype=float, device=device)
+        # # self.loss = manhattan_loss
+        # self.loss = nn.CrossEntropyLoss
+        #
+        self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()), lr=0.001, weight_decay=0.1)
+        # print(f'transformer parameters: {list(self.transformer.parameters())}')
+
+    def compute_returns(self, rewards, gamma=0.99):
+        """
+        Given a list of rewards [r0, r1, r2, …, r_{T-1}],
+        returns a list of discounted returns:
+          G_t = r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + …
+        """
+        R = 0
+        returns = []
+        for r in reversed(rewards):
+            R = r + gamma * R
+            returns.insert(0, R)
+        returns = torch.tensor(returns)  # shape: (episode_length,)
+        # (Optionally) normalize returns to reduce variance:
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        return returns
+
     def learn(self, total_timesteps: int):
         """
         Conduct the learning process of the agent
@@ -246,6 +282,7 @@ class AlphaRouterAgent:
 
         print(f"Success count: {self.success_count}")
         print(f"Success %: {self.success_count / total_timesteps * 100}")
+        print(f"Average loss: {self.loss_sum / total_timesteps}")
 
     def episode(self):
         """
@@ -253,51 +290,102 @@ class AlphaRouterAgent:
         """
         # Generate a new interaction circuit
         self.env.reset()
-        render_rgb(self.env)
+        log_probs = []
+        rewards = []
+        # try:
+        #     render_rgb(self.env)
+        # except:
+        #     pass
 
-        state: RoutingState = self.env._state
         interaction_circuit = state.interaction_circuit[:self.lookahead_length]
-        print(f'interaction_circuit: {interaction_circuit}')
+        # print(f'interaction_circuit: {interaction_circuit}')
+
+        swaps = 0
 
         for _ in range(self.episode_limit):
             # print(state.mapping)
             state_embedding = self.embed_nodes()
-            action = self.get_action(state_embedding)
+            action, log_prob = self.get_action(state_embedding)
             observation, reward, done, truncated, info = self.env.step(action)
             self.replay_buffer.store(state_embedding, action, reward, self.embed_nodes(), done)
+
+            log_probs.append(log_prob)
+            rewards.append(reward)
             # render_rgb(self.env)
             # self.env.render()
             # sleep(1)
-            print(f'REPLAY BUFFER SAMPLE: {self.replay_buffer.sample(1)}')
+            # print(f'REPLAY BUFFER SAMPLE: {self.replay_buffer.sample(1)}')
+            # self.optimizer.zero_grad()
+            # loss = self.loss(state.mapping[interaction_circuit[0][0]], state.mapping[interaction_circuit[0][1]])
+            # print(f'Loss: {loss}')
+            # self.loss_sum += loss
+            # loss.backward()
+            # self.optimizer.step()
+            # loss.backward()
+            # self.optimizer.step()
+            # self.optimizer.zero_grad()
+            swaps += 1
             if done:
                 self.success_count += 1
                 break
 
-    def get_action(self, node_embedding) -> int:
+        # print(f'Loss: {self.loss_sum / self.episode_limit}')
+        print(f'swaps: {swaps}')
+        # self.loss_sum = 0
+        # self.optimizer.zero_grad()
+        # loss = self.loss(state.mapping[interaction_circuit[0][0]], state.mapping[interaction_circuit[0][1]])
+        # print(f'Loss: {loss}')
+        # self.loss_sum += loss
+        # loss.backward()
+        # self.optimizer.step()
+
+        returns = self.compute_returns(rewards)
+        policy_loss = []
+        for log_prob, G_t in zip(log_probs, returns):
+            policy_loss.append(-log_prob * G_t)
+        policy_loss = torch.stack(policy_loss).sum()
+
+        # (c) backprop / gradient step
+        self.optimizer.zero_grad()
+        policy_loss.backward()
+        self.optimizer.step()
+
+        print(f"Loss: {policy_loss}")
+
+    def get_action(self, node_embedding) -> (int, int):
         """
         Based on the current environment state, get an action suggested by the agent
         :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
         :return: Action - index of the swap option (last option is no swap)
         """
-        transformer_output = self.transformer.forward(node_embedding)
+        # x = node_embedding.unsqueeze(0)
+        # transformer_output = self.transformer.forward(x)
+        # transformer_output = transformer_output.squeeze(0)
+        transformer_output = self.transformer(node_embedding)
         # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
         # as we want to output the optimal swap action
         swap_scores = transformer_output.sum(dim=0)
-        softmax_output = self.softmax(swap_scores)
+        # softmax_output = self.softmax(swap_scores)
+        softmax_output = torch.softmax(swap_scores, dim=-1)
+        dist = torch.distributions.Categorical(probs=softmax_output)
 
-        action = torch.multinomial(softmax_output, 1)
+        # action = torch.multinomial(softmax_output, 1)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
 
-        print(f'Node embedding: {node_embedding}')
-        print(f'Transformer output: {transformer_output}')
-        print(f'Transformer output shape: {transformer_output.shape}')
-        print(f'Swap scores: {swap_scores}')
-        print(f'Swap scores shape: {swap_scores.shape}')
-        print(f'Softmax output: {softmax_output}')
-        print(f'Softmax output shape: {softmax_output.shape}')
-        print(f'Action: {action}')
-        print(f'Intified action: {int(action)}')
+        # print(f'Node embedding: {node_embedding}')
+        # print(f'Transformer output: {transformer_output}')
+        # print(f'Transformer output shape: {transformer_output.shape}')
+        # print(f'Swap scores: {swap_scores}')
+        # print(f'Swap scores shape: {swap_scores.shape}')
+        # print(f'Softmax output: {softmax_output}')
+        # print(f'Softmax output shape: {softmax_output.shape}')
+        # print(f'Action: {action}')
+        # print(f'Intified action: {int(action)}')
+        # print(f'Logical q0: {state.mapping[0]}')
+        # print(f'Logical q7: {state.mapping[7]}')
 
-        return int(action)
+        return action.item(), log_prob
 
     def embed_nodes(self):
         """
@@ -344,14 +432,30 @@ class AlphaRouterAgent:
         if len(feature_matrix) == 0:
             return torch.zeros((LOOKAHEAD_LENGTH, EMBEDDING_DIM + 1))
 
-        print(f'Qubit dependencies: {qubit_gate_dependencies}')
+        # print(f'Qubit dependencies: {qubit_gate_dependencies}')
 
         return torch.stack(feature_matrix)
 
 
+class ManhattanRewarder(BasicRewarder):
+
+    def __init__(self):
+        super().__init__()
+
+    def compute_reward(
+        self,
+        *,
+        old_state: RoutingState,
+        action: int,
+        new_state: RoutingState,
+    ) -> float:
+        interaction_circuit = new_state.interaction_circuit
+        return np.abs(new_state.mapping[interaction_circuit[0][0]] - new_state.mapping[interaction_circuit[0][1]])
+
 if __name__ == '__main__':
     connection_graph = nx.Graph()
-    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
+    # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
+    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
     nx.draw(connection_graph, with_labels=True)
     plt.show()
 
@@ -361,7 +465,9 @@ if __name__ == '__main__':
         observe_legal_surpasses=True,
         observe_connection_graph=True,
         connection_graph=connection_graph,
-        render_mode="rgb_array"
+        render_mode="rgb_array",
+        rewarder=None,
+        interaction_generator=CustomInteractionGenerator()
     )
     # action_space = env.action_space
     # observation_space = env.observation_space
@@ -387,7 +493,10 @@ if __name__ == '__main__':
     # transformer_output = transformer.forward(node_embedding)
     # print(transformer_output)
 
-    model.learn(1e0)
+    # model.learn(5e2)
+    print(f'transformer parameters: {list(model.transformer.parameters())}')
+    model.learn(1e3)
+    print(f'transformer parameters: {list(model.transformer.parameters())}')
 
     # model = PPO("MultiInputPolicy", env, verbose=1)
     # model.learn(int(1e3))
