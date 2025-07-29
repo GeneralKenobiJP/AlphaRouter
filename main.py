@@ -13,6 +13,7 @@ import random
 
 from torch import nn, Tensor
 
+import graphviz
 from torchviz import make_dot
 
 from custom_interaction_generator import CustomInteractionGenerator
@@ -229,7 +230,7 @@ class AlphaRouterAgent:
         self.env = env
         self.env.rewarder = ManhattanRewarder()
         self.reward = 0
-        self.episode_limit = 100  # The maximal number of steps in a single episode
+        self.episode_limit = 150  # The maximal number of steps in a single episode
         self.success_count = 0  # How many times did we achieve a successful routing during the learning process
         self.loss_sum = 0
         self.lookahead_length = lookahead_length
@@ -277,14 +278,27 @@ class AlphaRouterAgent:
         Conduct the learning process of the agent
         :param total_timesteps: Number of episodes during the learning process
         """
+        losses = []
+
         for i in range(int(total_timesteps)):
-            self.episode()
+            print(f"Episode: {i}...")
+            loss = self.episode()
+            losses.append(loss.detach())
 
         print(f"Success count: {self.success_count}")
         print(f"Success %: {self.success_count / total_timesteps * 100}")
         print(f"Average loss: {self.loss_sum / total_timesteps}")
 
-    def episode(self):
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(1, len(losses) + 1), losses)
+        plt.title('Training Loss per Episode')
+        plt.xlabel('Episode')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+    def episode(self) -> Tensor:
         """
         Run an episode, i.e. try to solve one particular circuit
         """
@@ -352,6 +366,8 @@ class AlphaRouterAgent:
 
         print(f"Loss: {policy_loss}")
 
+        return policy_loss
+
     def get_action(self, node_embedding) -> (int, int):
         """
         Based on the current environment state, get an action suggested by the agent
@@ -362,6 +378,7 @@ class AlphaRouterAgent:
         # transformer_output = self.transformer.forward(x)
         # transformer_output = transformer_output.squeeze(0)
         transformer_output = self.transformer(node_embedding)
+        # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
         # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
         # as we want to output the optimal swap action
         swap_scores = transformer_output.sum(dim=0)
@@ -450,7 +467,9 @@ class ManhattanRewarder(BasicRewarder):
         new_state: RoutingState,
     ) -> float:
         interaction_circuit = new_state.interaction_circuit
-        return np.abs(new_state.mapping[interaction_circuit[0][0]] - new_state.mapping[interaction_circuit[0][1]])
+        if len(interaction_circuit) < 1:
+            return 0
+        return -np.abs(new_state.mapping[interaction_circuit[0][0]] - new_state.mapping[interaction_circuit[0][1]])
 
 if __name__ == '__main__':
     connection_graph = nx.Graph()
@@ -494,9 +513,9 @@ if __name__ == '__main__':
     # print(transformer_output)
 
     # model.learn(5e2)
-    print(f'transformer parameters: {list(model.transformer.parameters())}')
-    model.learn(1e3)
-    print(f'transformer parameters: {list(model.transformer.parameters())}')
+    # print(f'transformer parameters: {list(model.transformer.parameters())}')
+    model.learn(5e2)
+    # print(f'transformer parameters: {list(model.transformer.parameters())}')
 
     # model = PPO("MultiInputPolicy", env, verbose=1)
     # model.learn(int(1e3))
