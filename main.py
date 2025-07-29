@@ -1,12 +1,11 @@
 import math
 from collections import deque
-from typing import List, Set, Union, Any
+from typing import List, Set, Union
 
 import networkx as nx
 import numpy as np
 import torch
-from numpy import ndarray, dtype
-from qgym.envs import InitialMapping, Routing
+from qgym.envs import Routing
 from qgym.envs.routing import BasicRewarder, RoutingState
 import matplotlib.pyplot as plt
 import random
@@ -49,7 +48,7 @@ class PositionalEncoding(nn.Module):
 
         position = torch.arange(lookahead_length).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, final_embedding_dim, 2) * (-math.log(1e5) / embedding_dim))
-        pe = torch.zeros(LOOKAHEAD_LENGTH, final_embedding_dim)
+        pe = torch.zeros(lookahead_length, final_embedding_dim)
         pe[:, 0::2] = torch.sin(position * div_term)
         final_embedding_dim_even = (final_embedding_dim // 2) * 2  # Rounded up to the nearest even number so that odd indices slicing works
         pe[:, 1::2] = torch.cos(position * div_term[::final_embedding_dim_even])
@@ -84,7 +83,6 @@ class TransformerLayer(nn.Module):
         # self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
         self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads)
         self.norm1 = nn.LayerNorm(embedding_dim)
-        # self.dropout1 = nn.Dropout()
         self.ffn = nn.Sequential(
             nn.Linear(embedding_dim, ffn_dim),
             nn.ReLU(),
@@ -145,14 +143,8 @@ class Transformer(nn.Module):
         """
         x = self.positional_encoding(x)
         if self.padding_dim > 0:
-            # print(f'pre-padding x shape: {x.shape}')
-            # print(f'padding_dim: {self.padding_dim}')
-
             # Pad the input with 0s so that the dimensionality is a multiple of the number of heads
             x = nn.functional.pad(x, (0, self.padding_dim), value=0)
-
-            # print(f'padded x shape: {x.shape}')
-            # print(f'padded x: {x}')
 
         for layer in self.layers:
             x = layer(x)
@@ -234,28 +226,18 @@ class AlphaRouterAgent:
         self.success_count = 0  # How many times did we achieve a successful routing during the learning process
         self.loss_sum = 0
         self.lookahead_length = lookahead_length
+        self.embedding_dim = embedding_dim
         state: RoutingState = self.env._state
         connection_graph = state.connection_graph
         self.qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(), embedding_dim=embedding_dim)
         self.transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length, swap_options=len(connection_graph.edges) + 1)
-        self.softmax = nn.Softmax(dim=0)
         device = torch.device("cuda" if torch.cuda.is_available() and gpu else "cpu")
         self.replay_buffer = ReplayBuffer(
             buffer_size,
             device
         )
 
-        # self.initial_mapping = state.mapping
-        # def manhattan_loss(q0_physical: int, q1_physical: int) -> torch.Tensor:
-        #     # return torch.tensor(np.sum(np.abs(mapping - self.initial_mapping)), dtype=float, requires_grad=True, device=device)
-        #     # print(f"q0_physical: {q0_physical}")
-        #     # print(f"q1_physical: {q1_physical}")
-        #     return torch.tensor(np.abs(q1_physical - q0_physical), dtype=float, device=device)
-        # # self.loss = manhattan_loss
-        # self.loss = nn.CrossEntropyLoss
-        #
         self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()), lr=0.001, weight_decay=0.1)
-        # print(f'transformer parameters: {list(self.transformer.parameters())}')
 
     def compute_returns(self, rewards, gamma=0.99):
         """
@@ -268,7 +250,7 @@ class AlphaRouterAgent:
         for r in reversed(rewards):
             R = r + gamma * R
             returns.insert(0, R)
-        returns = torch.tensor(returns)  # shape: (episode_length,)
+        returns = torch.tensor(returns)
         # (Optionally) normalize returns to reduce variance:
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         return returns
@@ -311,7 +293,7 @@ class AlphaRouterAgent:
         # except:
         #     pass
 
-        interaction_circuit = state.interaction_circuit[:self.lookahead_length]
+        # interaction_circuit = state.interaction_circuit[:self.lookahead_length]
         # print(f'interaction_circuit: {interaction_circuit}')
 
         swaps = 0
@@ -325,33 +307,13 @@ class AlphaRouterAgent:
 
             log_probs.append(log_prob)
             rewards.append(reward)
-            # render_rgb(self.env)
-            # self.env.render()
-            # sleep(1)
-            # print(f'REPLAY BUFFER SAMPLE: {self.replay_buffer.sample(1)}')
-            # self.optimizer.zero_grad()
-            # loss = self.loss(state.mapping[interaction_circuit[0][0]], state.mapping[interaction_circuit[0][1]])
-            # print(f'Loss: {loss}')
-            # self.loss_sum += loss
-            # loss.backward()
-            # self.optimizer.step()
-            # loss.backward()
-            # self.optimizer.step()
-            # self.optimizer.zero_grad()
+
             swaps += 1
             if done:
                 self.success_count += 1
                 break
 
-        # print(f'Loss: {self.loss_sum / self.episode_limit}')
         print(f'swaps: {swaps}')
-        # self.loss_sum = 0
-        # self.optimizer.zero_grad()
-        # loss = self.loss(state.mapping[interaction_circuit[0][0]], state.mapping[interaction_circuit[0][1]])
-        # print(f'Loss: {loss}')
-        # self.loss_sum += loss
-        # loss.backward()
-        # self.optimizer.step()
 
         returns = self.compute_returns(rewards)
         policy_loss = []
@@ -359,7 +321,7 @@ class AlphaRouterAgent:
             policy_loss.append(-log_prob * G_t)
         policy_loss = torch.stack(policy_loss).sum()
 
-        # (c) backprop / gradient step
+        # backprop / gradient step
         self.optimizer.zero_grad()
         policy_loss.backward()
         self.optimizer.step()
@@ -379,10 +341,10 @@ class AlphaRouterAgent:
         # transformer_output = transformer_output.squeeze(0)
         transformer_output = self.transformer(node_embedding)
         # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
+
         # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
         # as we want to output the optimal swap action
         swap_scores = transformer_output.sum(dim=0)
-        # softmax_output = self.softmax(swap_scores)
         softmax_output = torch.softmax(swap_scores, dim=-1)
         dist = torch.distributions.Categorical(probs=softmax_output)
 
@@ -447,9 +409,7 @@ class AlphaRouterAgent:
             feature_matrix.append(gate_vector)
 
         if len(feature_matrix) == 0:
-            return torch.zeros((LOOKAHEAD_LENGTH, EMBEDDING_DIM + 1))
-
-        # print(f'Qubit dependencies: {qubit_gate_dependencies}')
+            return torch.zeros((self.lookahead_length, self.embedding_dim + 1))
 
         return torch.stack(feature_matrix)
 
@@ -494,32 +454,18 @@ if __name__ == '__main__':
     # print(observation_space)
 
     model = AlphaRouterAgent(env)
-    state: RoutingState = model.env._state
-    print(state.interaction_circuit.shape)
+
+    # state: RoutingState = model.env._state
+    # print(state.interaction_circuit.shape)
+
     node_embedding = model.embed_nodes()
-    print(node_embedding.shape)
-    print(node_embedding)
+    # print(node_embedding.shape)
+    # print(node_embedding)
 
     positional_encoding = PositionalEncoding()
     context_encoding = positional_encoding.forward(node_embedding)
     print(context_encoding)
 
-    # transformer_layer = TransformerLayer((EMBEDDING_DIM + 1), 6, EMBEDDING_DIM + 1)
-    # transformer_layer_output = transformer_layer.forward(context_encoding)
-    # print(transformer_layer_output)
-
-    # transformer = Transformer(EMBEDDING_DIM, NUM_HEADS, FFN_DIM, NUM_LAYERS, LOOKAHEAD_LENGTH)
-    # transformer_output = transformer.forward(node_embedding)
-    # print(transformer_output)
-
-    # model.learn(5e2)
-    # print(f'transformer parameters: {list(model.transformer.parameters())}')
-    model.learn(5e2)
-    # print(f'transformer parameters: {list(model.transformer.parameters())}')
-
-    # model = PPO("MultiInputPolicy", env, verbose=1)
-    # model.learn(int(1e3))
-    #
-    # print(model.get_parameters())
+    model.learn(6e2)
 
     print('Successful execution')
