@@ -266,12 +266,20 @@ class AlphaRouterAgent:
         """
         losses = []
         swaps = []
+        # Compute 50-episode moving average of loss
+        ma_window = 50
+        ma_losses = []
 
         for i in range(int(total_timesteps)):
             print(f"Episode: {i}...")
             loss, swap = self.episode()
             losses.append(loss.detach())
             swaps.append(swap)
+
+        for i in range(len(losses)):
+            start = max(0, i - ma_window + 1)
+            window_losses = losses[start:i + 1]
+            ma_losses.append(sum(window_losses) / len(window_losses))
 
         print(f"Success count: {self.success_count}")
         print(f"Success %: {self.success_count / total_timesteps * 100}")
@@ -297,6 +305,16 @@ class AlphaRouterAgent:
         ax.legend(lns, labels, loc='upper center')
 
         ax.set_title('Training Loss and Swaps per Episode')
+        ax.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(episodes, ma_losses, label=f'{ma_window}-Episode Moving Avg', linewidth=2)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Loss')
+        ax.set_title('Training Loss 50-Episode MA')
+        ax.legend()
         ax.grid(True)
         plt.tight_layout()
         plt.show()
@@ -357,10 +375,11 @@ class AlphaRouterAgent:
         :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
         :return: Action - index of the swap option (last option is no swap)
         """
-        # x = node_embedding.unsqueeze(0)
+        x = node_embedding.unsqueeze(0)
         # transformer_output = self.transformer(x)
         # transformer_output = transformer_output.squeeze(0)
-        transformer_output = self.transformer(node_embedding)
+        transformer_output = self.transformer(x)
+        transformer_output = transformer_output.squeeze(0)
         # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
 
         # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
@@ -480,6 +499,10 @@ if __name__ == '__main__':
     # print(state.interaction_circuit.shape)
 
     # model.learn(6e2)
-    model.learn(400)
+    # model.learn(1000)
+    model.learn(5)
+
+    has_grad = all(p.grad is not None and p.grad.abs().sum() > 0 for p in model.transformer.parameters())
+    print("Gradients flowing:", has_grad)
 
     print('Successful execution')
