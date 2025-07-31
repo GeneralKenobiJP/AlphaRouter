@@ -50,8 +50,12 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, final_embedding_dim, 2) * (-math.log(1e5) / embedding_dim))
         pe = torch.zeros(lookahead_length, final_embedding_dim)
         pe[:, 0::2] = torch.sin(position * div_term)
-        final_embedding_dim_even = (final_embedding_dim // 2) * 2  # Rounded up to the nearest even number so that odd indices slicing works
+
+        # Rounded up to the nearest even number so that odd indices slicing works
+        final_embedding_dim_even = final_embedding_dim if final_embedding_dim % 2 == 0 else final_embedding_dim - 1
         pe[:, 1::2] = torch.cos(position * div_term[::final_embedding_dim_even])
+        print(f'Final_embedding_dim: {final_embedding_dim}')
+        print(f'Final_embedding_dim_even: {final_embedding_dim_even}')
         self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -80,8 +84,8 @@ class TransformerLayer(nn.Module):
         """
         super().__init__()
 
-        # self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
-        self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads)
+        self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
+        # self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads)
         self.norm1 = nn.LayerNorm(embedding_dim)
         self.ffn = nn.Sequential(
             nn.Linear(embedding_dim, ffn_dim),
@@ -148,7 +152,7 @@ class Transformer(nn.Module):
 
         for layer in self.layers:
             x = layer(x)
-        return self.decoder.forward(x)
+        return self.decoder(x)
 
 class ReplayBuffer:
     """
@@ -261,26 +265,43 @@ class AlphaRouterAgent:
         :param total_timesteps: Number of episodes during the learning process
         """
         losses = []
+        swaps = []
 
         for i in range(int(total_timesteps)):
             print(f"Episode: {i}...")
-            loss = self.episode()
+            loss, swap = self.episode()
             losses.append(loss.detach())
+            swaps.append(swap)
 
         print(f"Success count: {self.success_count}")
         print(f"Success %: {self.success_count / total_timesteps * 100}")
         print(f"Average loss: {self.loss_sum / total_timesteps}")
 
-        plt.figure(figsize=(10, 5))
-        plt.plot(range(1, len(losses) + 1), losses)
-        plt.title('Training Loss per Episode')
-        plt.xlabel('Episode')
-        plt.ylabel('Loss')
-        plt.grid(True)
+        episodes = range(1, len(losses) + 1)
+        fig, ax = plt.subplots(figsize=(12, 6))
+        # Plot loss on the left y-axis
+        ln1 = ax.plot(episodes, losses, label='Loss per Episode')
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Loss', color=ln1[0].get_color())
+        ax.tick_params(axis='y', labelcolor=ln1[0].get_color())
+
+        # Create a second y-axis for swaps
+        ax2 = ax.twinx()
+        ln2 = ax2.plot(episodes, swaps, label='Swaps per Episode', color='magenta')
+        ax2.set_ylabel('Swaps', color=ln2[0].get_color())
+        ax2.tick_params(axis='y', labelcolor=ln2[0].get_color())
+
+        # Combine legends from both axes
+        lns = ln1 + ln2
+        labels = [l.get_label() for l in lns]
+        ax.legend(lns, labels, loc='upper center')
+
+        ax.set_title('Training Loss and Swaps per Episode')
+        ax.grid(True)
         plt.tight_layout()
         plt.show()
 
-    def episode(self) -> Tensor:
+    def episode(self) -> (Tensor, int):
         """
         Run an episode, i.e. try to solve one particular circuit
         """
@@ -328,7 +349,7 @@ class AlphaRouterAgent:
 
         print(f"Loss: {policy_loss}")
 
-        return policy_loss
+        return policy_loss, swaps
 
     def get_action(self, node_embedding) -> (int, int):
         """
@@ -337,7 +358,7 @@ class AlphaRouterAgent:
         :return: Action - index of the swap option (last option is no swap)
         """
         # x = node_embedding.unsqueeze(0)
-        # transformer_output = self.transformer.forward(x)
+        # transformer_output = self.transformer(x)
         # transformer_output = transformer_output.squeeze(0)
         transformer_output = self.transformer(node_embedding)
         # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
@@ -458,14 +479,7 @@ if __name__ == '__main__':
     # state: RoutingState = model.env._state
     # print(state.interaction_circuit.shape)
 
-    node_embedding = model.embed_nodes()
-    # print(node_embedding.shape)
-    # print(node_embedding)
-
-    positional_encoding = PositionalEncoding()
-    context_encoding = positional_encoding.forward(node_embedding)
-    print(context_encoding)
-
-    model.learn(6e2)
+    # model.learn(6e2)
+    model.learn(400)
 
     print('Successful execution')
