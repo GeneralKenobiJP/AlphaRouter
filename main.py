@@ -9,10 +9,13 @@ from qgym.envs import Routing
 from qgym.envs.routing import BasicRewarder, RoutingState
 import matplotlib.pyplot as plt
 import random
+import cudnn
 
 from torch import nn, Tensor
 
 import graphviz
+from torch.amp import GradScaler, autocast
+from torch.types import Device
 from torchviz import make_dot
 
 from custom_interaction_generator import CustomInteractionGenerator
@@ -180,19 +183,19 @@ class ReplayBuffer:
         We detach and move everything to CPU to avoid pinning GPU memory.
         """
         # ensure everything is on CPU and detached
-        stored_state = state.detach().cpu()
-        stored_action = (action.detach().cpu() if isinstance(action, torch.Tensor)
-              else torch.tensor(action, dtype=torch.long))
-        stored_reward = torch.tensor(reward, dtype=torch.float32)
-        stored_next_state = next_state.detach().cpu()
-        stored_done = torch.tensor(done, dtype=torch.float32)
+        stored_state = state.detach().to(self.device)
+        stored_action = (action.detach() if isinstance(action, torch.Tensor)
+              else torch.tensor(action, dtype=torch.int, device=self.device))
+        stored_reward = torch.tensor(reward, dtype=torch.float32, device=self.device)
+        stored_next_state = next_state.detach().to(self.device)
+        stored_done = torch.tensor(done, dtype=torch.float32, device=self.device)
         self.buffer.append((stored_state, stored_action, stored_reward, stored_next_state, stored_done))
 
     def sample(self, batch_size: int):
         """
         Samples a batch of transitions, returning:
             states:     float32 tensor (B, *state_shape)
-            actions:    long    tensor (B,)
+            actions:    int    tensor (B,)
             rewards:    float32 tensor (B,)
             next_states float32 tensor (B, *state_shape)
             dones:      float32 tensor (B,)
@@ -201,28 +204,32 @@ class ReplayBuffer:
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        states = torch.stack(states, dim=0).to(self.device)
-        actions = torch.stack(actions, dim=0).to(self.device)
-        rewards = torch.stack(rewards, dim=0).to(self.device)
-        next_states = torch.stack(next_states, dim=0).to(self.device)
-        dones = torch.stack(dones, dim=0).to(self.device)
+        states = torch.stack(states, dim=0)
+        actions = torch.stack(actions, dim=0)
+        rewards = torch.stack(rewards, dim=0)
+        next_states = torch.stack(next_states, dim=0)
+        dones = torch.stack(dones, dim=0)
 
         return states, actions, rewards, next_states, dones
 
     def __len__(self):
         return len(self.buffer)
 
-class AlphaRouterAgent:
+class AlphaRouterAgent(nn.Module):
     """The AlphaRouter routing agent"""
-    def __init__(self, env: Routing, embedding_dim: int = 20, num_heads: int = 6, ffn_dim: int = 64, num_layers: int = 4, lookahead_length: int = 48, buffer_size: int = int(1e6), gpu: bool = True):
+    def __init__(self, env: Routing, device: Device, embedding_dim: int = 20, num_heads: int = 6, ffn_dim: int = 64,
+                 num_layers: int = 4, lookahead_length: int = 48, buffer_size: int = int(1e6), *args, **kwargs):
         """
         :param env: Particular routing environment we want to apply the agent to
+        :param device: Device to run the agent on (cuda for Nvidia graphics card, cpu for a standard cpu)
         :param embedding_dim: Embedding dimension of the node embeddings (not including depth embedding)
         :param num_heads: Number of heads in a multihead attention layer
         :param ffn_dim: Dimensionality of the hidden layer in the feed forward layer
         :param num_layers: Number of transformer layers
         :param lookahead_length: The maximal number of the gates ahead that we will analyze
         """
+        super().__init__(*args, **kwargs)
+        self.device = device
         self.env = env
         self.env.rewarder = ManhattanRewarder()
         self.reward = 0
@@ -233,14 +240,16 @@ class AlphaRouterAgent:
         self.embedding_dim = embedding_dim
         state: RoutingState = self.env._state
         connection_graph = state.connection_graph
-        self.qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(), embedding_dim=embedding_dim)
-        self.transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length, swap_options=len(connection_graph.edges) + 1)
-        device = torch.device("cuda" if torch.cuda.is_available() and gpu else "cpu")
+        self.qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(), embedding_dim=embedding_dim).to(self.device)
+        self.transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length, swap_options=len(connection_graph.edges) + 1).to(self.device)
         self.replay_buffer = ReplayBuffer(
             buffer_size,
-            device
+            self.device
         )
 
+        self.to(self.device)
+
+        self.scaler = GradScaler(self.device.type)
         self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()), lr=0.001, weight_decay=0.1)
 
     def compute_returns(self, rewards, gamma=0.99):
@@ -273,7 +282,7 @@ class AlphaRouterAgent:
         for i in range(int(total_timesteps)):
             print(f"Episode: {i}...")
             loss, swap = self.episode()
-            losses.append(loss.detach())
+            losses.append(loss.detach().cpu())
             swaps.append(swap)
 
         for i in range(len(losses)):
@@ -325,6 +334,8 @@ class AlphaRouterAgent:
         """
         # Generate a new interaction circuit
         self.env.reset()
+        self.optimizer.zero_grad()
+
         log_probs = []
         rewards = []
         # try:
@@ -361,9 +372,9 @@ class AlphaRouterAgent:
         policy_loss = torch.stack(policy_loss).sum()
 
         # backprop / gradient step
-        self.optimizer.zero_grad()
-        policy_loss.backward()
-        self.optimizer.step()
+        self.scaler.scale(policy_loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
 
         print(f"Loss: {policy_loss}")
 
@@ -375,22 +386,23 @@ class AlphaRouterAgent:
         :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
         :return: Action - index of the swap option (last option is no swap)
         """
-        x = node_embedding.unsqueeze(0)
-        # transformer_output = self.transformer(x)
-        # transformer_output = transformer_output.squeeze(0)
-        transformer_output = self.transformer(x)
-        transformer_output = transformer_output.squeeze(0)
-        # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
+        with autocast(self.device.type):
+            x = node_embedding.unsqueeze(0)
+            # transformer_output = self.transformer(x)
+            # transformer_output = transformer_output.squeeze(0)
+            transformer_output = self.transformer(x)
+            transformer_output = transformer_output.squeeze(0)
+            # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
 
-        # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
-        # as we want to output the optimal swap action
-        swap_scores = transformer_output.sum(dim=0)
-        softmax_output = torch.softmax(swap_scores, dim=-1)
-        dist = torch.distributions.Categorical(probs=softmax_output)
+            # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
+            # as we want to output the optimal swap action
+            swap_scores = transformer_output.sum(dim=0)
+            softmax_output = torch.softmax(swap_scores, dim=-1)
+            dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
 
-        # action = torch.multinomial(softmax_output, 1)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
+            # action = torch.multinomial(softmax_output, 1)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
 
         # print(f'Node embedding: {node_embedding}')
         # print(f'Transformer output: {transformer_output}')
@@ -434,8 +446,8 @@ class AlphaRouterAgent:
             physical_q1 = state.mapping[logical_q1]
             physical_q2 = state.mapping[logical_q2]
 
-            embedding_q1 = self.qubit_embedding(torch.tensor(physical_q1))
-            embedding_q2 = self.qubit_embedding(torch.tensor(physical_q2))
+            embedding_q1 = self.qubit_embedding(torch.tensor(physical_q1, device=self.device))
+            embedding_q2 = self.qubit_embedding(torch.tensor(physical_q2, device=self.device))
 
             gate_dependencies = qubit_gate_dependencies[logical_q1].union(qubit_gate_dependencies[logical_q2])
             depth = len(gate_dependencies) + 1
@@ -493,14 +505,21 @@ if __name__ == '__main__':
     # print(action_space)
     # print(observation_space)
 
-    model = AlphaRouterAgent(env)
+    print(f"cuda version: {torch.version.cuda}")  # e.g. "11.8"
+    print(f"cuda availability: {torch.cuda.is_available()}")
+    print(f"device count: {torch.cuda.device_count()}")  # number of GPUs
+    print(f"devices: {torch.cuda.get_device_name}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
+    print(f"device: {device}")
+    model = AlphaRouterAgent(env, device).to(device)
 
     # state: RoutingState = model.env._state
     # print(state.interaction_circuit.shape)
 
     # model.learn(6e2)
-    # model.learn(1000)
-    model.learn(5)
+    model.learn(500)
+    # model.learn(5)
 
     has_grad = all(p.grad is not None and p.grad.abs().sum() > 0 for p in model.transformer.parameters())
     print("Gradients flowing:", has_grad)
