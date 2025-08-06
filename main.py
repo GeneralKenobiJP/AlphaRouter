@@ -278,17 +278,29 @@ class AlphaRouterAgent(nn.Module):
         # Compute 50-episode moving average of loss
         ma_window = 50
         ma_losses = []
+        ma_swaps = []
+        returns = []
+        ma_returns = []
 
         for i in range(int(total_timesteps)):
             print(f"Episode: {i}...")
-            loss, swap = self.episode()
+            loss, swap, ep_return = self.episode()
             losses.append(loss.detach().cpu())
             swaps.append(swap)
+            returns.append(ep_return)
 
         for i in range(len(losses)):
             start = max(0, i - ma_window + 1)
             window_losses = losses[start:i + 1]
             ma_losses.append(sum(window_losses) / len(window_losses))
+
+            start = max(0, i - ma_window + 1)
+            window_swaps = swaps[start:i + 1]
+            ma_swaps.append(sum(window_swaps) / len(window_swaps))
+
+            start = max(0, i - ma_window + 1)
+            window_returns = returns[start:i + 1]
+            ma_returns.append(sum(window_returns) / len(window_returns))
 
         print(f"Success count: {self.success_count}")
         print(f"Success %: {self.success_count / total_timesteps * 100}")
@@ -319,6 +331,16 @@ class AlphaRouterAgent(nn.Module):
         plt.show()
 
         fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(episodes, returns, label=f'{ma_window}-Episode Moving Avg', linewidth=2)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Return')
+        ax.set_title('Returns per episode')
+        ax.legend()
+        ax.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        fig, ax = plt.subplots(figsize=(12, 6))
         ax.plot(episodes, ma_losses, label=f'{ma_window}-Episode Moving Avg', linewidth=2)
         ax.set_xlabel('Episode')
         ax.set_ylabel('Loss')
@@ -328,7 +350,27 @@ class AlphaRouterAgent(nn.Module):
         plt.tight_layout()
         plt.show()
 
-    def episode(self) -> (Tensor, int):
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', linewidth=2)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Swaps')
+        ax.set_title('Swaps per episode 50-Episode MA')
+        ax.legend()
+        ax.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(episodes, ma_returns, label=f'{ma_returns}-Episode Moving Avg', linewidth=2)
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Return')
+        ax.set_title('Returns per episode 50-Episode MA')
+        ax.legend()
+        ax.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+    def episode(self) -> (Tensor, int, int):
         """
         Run an episode, i.e. try to solve one particular circuit
         """
@@ -378,7 +420,7 @@ class AlphaRouterAgent(nn.Module):
 
         print(f"Loss: {policy_loss}")
 
-        return policy_loss, swaps
+        return policy_loss, swaps, sum(rewards)
 
     def get_action(self, node_embedding) -> (int, int):
         """
