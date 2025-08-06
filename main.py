@@ -19,6 +19,7 @@ from torch.types import Device
 from torchviz import make_dot
 
 from custom_interaction_generator import CustomInteractionGenerator
+from plotting import moving_average, plot
 
 EMBEDDING_DIM = 20      # AR paper embedding dimension
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length
@@ -275,12 +276,9 @@ class AlphaRouterAgent(nn.Module):
         """
         losses = []
         swaps = []
+        returns = []
         # Compute 50-episode moving average of loss
         ma_window = 50
-        ma_losses = []
-        ma_swaps = []
-        returns = []
-        ma_returns = []
 
         for i in range(int(total_timesteps)):
             print(f"Episode: {i}...")
@@ -289,86 +287,22 @@ class AlphaRouterAgent(nn.Module):
             swaps.append(swap)
             returns.append(ep_return)
 
-        for i in range(len(losses)):
-            start = max(0, i - ma_window + 1)
-            window_losses = losses[start:i + 1]
-            ma_losses.append(sum(window_losses) / len(window_losses))
-
-            start = max(0, i - ma_window + 1)
-            window_swaps = swaps[start:i + 1]
-            ma_swaps.append(sum(window_swaps) / len(window_swaps))
-
-            start = max(0, i - ma_window + 1)
-            window_returns = returns[start:i + 1]
-            ma_returns.append(sum(window_returns) / len(window_returns))
+        ma_losses = moving_average(losses, window=ma_window)
+        ma_swaps = moving_average(swaps, window=ma_window)
+        ma_returns = moving_average(returns, window=ma_window)
 
         print(f"Success count: {self.success_count}")
         print(f"Success %: {self.success_count / total_timesteps * 100}")
         print(f"Average loss: {self.loss_sum / total_timesteps}")
 
         episodes = range(1, len(losses) + 1)
-        fig, ax = plt.subplots(figsize=(12, 6))
-        # Plot loss on the left y-axis
-        ln1 = ax.plot(episodes, losses, label='Loss per Episode')
-        ax.set_xlabel('Episode')
-        ax.set_ylabel('Loss', color=ln1[0].get_color())
-        ax.tick_params(axis='y', labelcolor=ln1[0].get_color())
 
-        # Create a second y-axis for swaps
-        ax2 = ax.twinx()
-        ln2 = ax2.plot(episodes, swaps, label='Swaps per Episode', color='magenta')
-        ax2.set_ylabel('Swaps', color=ln2[0].get_color())
-        ax2.tick_params(axis='y', labelcolor=ln2[0].get_color())
-
-        # Combine legends from both axes
-        lns = ln1 + ln2
-        labels = [l.get_label() for l in lns]
-        ax.legend(lns, labels, loc='upper center')
-
-        ax.set_title('Training Loss and Swaps per Episode')
-        ax.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(episodes, returns, label=f'{ma_window}-Episode Moving Avg', linewidth=2)
-        ax.set_xlabel('Episode')
-        ax.set_ylabel('Return')
-        ax.set_title('Returns per episode')
-        ax.legend()
-        ax.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(episodes, ma_losses, label=f'{ma_window}-Episode Moving Avg', linewidth=2)
-        ax.set_xlabel('Episode')
-        ax.set_ylabel('Loss')
-        ax.set_title('Training Loss 50-Episode MA')
-        ax.legend()
-        ax.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', linewidth=2)
-        ax.set_xlabel('Episode')
-        ax.set_ylabel('Swaps')
-        ax.set_title('Swaps per episode 50-Episode MA')
-        ax.legend()
-        ax.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(episodes, ma_returns, label=f'{ma_returns}-Episode Moving Avg', linewidth=2)
-        ax.set_xlabel('Episode')
-        ax.set_ylabel('Return')
-        ax.set_title('Returns per episode 50-Episode MA')
-        ax.legend()
-        ax.grid(True)
-        plt.tight_layout()
-        plt.show()
+        plot(episodes, losses, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Training Loss per Episode')
+        plot(episodes, swaps, label='Swaps per Episode', xlabel='Episode', ylabel='Swaps', title='Swaps per Episode')
+        plot(episodes, returns, label=f'Returns per episode', xlabel='Episode', ylabel='Return', title='Returns per pisode')
+        plot(episodes, ma_losses, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Loss', title='Training Loss 50-Episode MA')
+        plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title='Swaps per episode 50-Episode MA')
+        plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
 
     def episode(self) -> (Tensor, int, int):
         """
@@ -560,8 +494,8 @@ if __name__ == '__main__':
     # print(state.interaction_circuit.shape)
 
     # model.learn(6e2)
-    model.learn(500)
-    # model.learn(5)
+    # model.learn(500)
+    model.learn(5)
 
     has_grad = all(p.grad is not None and p.grad.abs().sum() > 0 for p in model.transformer.parameters())
     print("Gradients flowing:", has_grad)
