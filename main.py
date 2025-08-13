@@ -1,14 +1,12 @@
 import math
-import multiprocessing
 import time
 from collections import deque
 from typing import List, Set, Union
 
 import networkx as nx
-import numpy as np
 import torch
 from qgym.envs import Routing
-from qgym.envs.routing import BasicRewarder, RoutingState
+from qgym.envs.routing import RoutingState
 import matplotlib.pyplot as plt
 import random
 
@@ -21,6 +19,7 @@ from torchviz import make_dot
 
 from custom_interaction_generator import CustomInteractionGenerator
 from plotting import moving_average, plot
+from manhattan_rewarder import ManhattanRewarder
 
 from gymnasium.vector import SyncVectorEnv
 
@@ -381,40 +380,78 @@ class AlphaRouterAgent(nn.Module):
 
         return returns, mask
 
-    def learn(self, total_timesteps: int, ma_window: int = 50) -> None:
+    def get_action(self, node_embedding) -> (Tensor, Tensor):
         """
-        Conduct the learning process of the agent
-        :param total_timesteps: Number of episodes during the learning process
-        :param ma_window: The size of the moving average window used for filtering out noise in the graphs
+        Based on the current environment state, get an action suggested by the agent
+        :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
+        :return:
+            Action - tensor of the index of the swap option (last option is no swap)
+            log_prob - tensor of log probability of the action being optimal as predicted by the model
         """
-        swaps = []
-        returns = []
+        with autocast(self.device.type):
+            transformer_output = self.transformer(node_embedding)
+            # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
 
-        if self.device.type == 'cpu':
-            for i in range(int(total_timesteps)):
-                print(f"Episode: {i}...")
-                loss, swap, ep_return = self.episode()
-                swaps.append(swap)
-                returns.append(ep_return)
-        else:
-            for i in range(int(total_timesteps // N_ENVS)):
-                print(f"Episode: {i * N_ENVS}...")
-                loss, ep_swaps, ep_return = self.batch()
-                swaps.extend(ep_swaps)
-                returns.extend(ep_return.detach().cpu())
+            # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
+            # as we want to output the optimal swap action
+            swap_scores = transformer_output.sum(dim=1)
+            softmax_output = torch.softmax(swap_scores, dim=-1)
+            dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
 
-        ma_swaps = moving_average(swaps, window=ma_window)
-        ma_returns = moving_average(returns, window=ma_window)
+            action = dist.sample()
+            log_prob: Tensor = dist.log_prob(action)
 
-        print(f"Success count: {self.success_count}")
-        print(f"Success %: {self.success_count / total_timesteps * 100}")
+        return action, log_prob
 
-        episodes = range(1, total_timesteps + 1)
+    def episode(self) -> (Tensor, int, int):
+        """
+        Run an episode, i.e. try to solve one particular circuit
 
-        plot(episodes, swaps, label='Swaps per Episode', xlabel='Episode', ylabel='Swaps', title='Swaps per Episode')
-        plot(episodes, returns, label=f'Returns per episode', xlabel='Episode', ylabel='Return', title='Returns per episode')
-        plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title='Swaps per episode 50-Episode MA')
-        plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
+        Returns
+        -------
+        A tuple of 3 elements:
+        - A tensor of losses of shape (#steps)
+        - A list of swap numbers per each environment
+        - A tensor of undiscounted rewards per each environment (for plotting and analysis)
+        """
+        # Generate a new interaction circuit
+        self.env.reset()
+        self.optimizer.zero_grad()
+
+        log_probs = []
+        rewards = []
+
+        swaps = 0
+        state_embedding = self.embed_nodes(self.env._state)
+
+        for _ in range(self.episode_limit):
+            action, log_prob = self.get_action(state_embedding.unsqueeze(0))
+            observation, reward, done, truncated, info = self.env.step(action)
+
+            new_embedding = self.embed_nodes(self.env._state)
+            self.replay_buffer.store(state_embedding, action, reward, new_embedding, done)
+            state_embedding = new_embedding
+
+            log_probs.append(log_prob)
+            rewards.append(reward)
+
+            swaps += 1
+            if done:
+                self.success_count += 1
+                break
+
+        returns = self.compute_returns(rewards)
+        policy_loss = []
+        for log_prob, G_t in zip(log_probs, returns):
+            policy_loss.append(-log_prob * G_t)
+        policy_loss = torch.stack(policy_loss).sum()
+
+        # backprop / gradient step
+        self.scaler.scale(policy_loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+        return policy_loss, swaps, sum(rewards)
 
     def batch(self) -> (Tensor, list[int], Tensor):
         """
@@ -446,18 +483,7 @@ class AlphaRouterAgent(nn.Module):
 
         for step_idx in range(self.episode_limit):
 
-            with autocast(self.device.type):
-                transformer_output = self.transformer(state_embeddings)
-                # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
-
-                # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options)
-                # to (number of swap_options) as we want to output the optimal swap action
-                swap_scores = transformer_output.sum(dim=1)
-                softmax_output = torch.softmax(swap_scores, dim=-1)
-                dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
-
-                actions = dist.sample()
-                log_probs: Tensor = dist.log_prob(actions)
+            actions, log_probs = self.get_action(state_embeddings)
 
             for i in range(N_ENVS):
                 if done_list[i] is True:
@@ -506,95 +532,6 @@ class AlphaRouterAgent(nn.Module):
 
         return policy_loss, swaps, undiscounted_returns
 
-
-    def episode(self) -> (Tensor, int, int):
-        """
-        Run an episode, i.e. try to solve one particular circuit
-
-        Returns
-        -------
-        A tuple of 3 elements:
-        - A tensor of losses of shape (#steps)
-        - A list of swap numbers per each environment
-        - A tensor of undiscounted rewards per each environment (for plotting and analysis)
-        """
-        # Generate a new interaction circuit
-        self.env.reset()
-        self.optimizer.zero_grad()
-
-        log_probs = []
-        rewards = []
-
-        swaps = 0
-        state_embedding = self.embed_nodes(self.env._state)
-
-        for _ in range(self.episode_limit):
-            action, log_prob = self.get_action(state_embedding)
-            observation, reward, done, truncated, info = self.env.step(action)
-
-            new_embedding = self.embed_nodes(self.env._state)
-            self.replay_buffer.store(state_embedding, action, reward, new_embedding, done)
-            state_embedding = new_embedding
-
-            log_probs.append(log_prob)
-            rewards.append(reward)
-
-            swaps += 1
-            if done:
-                self.success_count += 1
-                break
-
-        returns = self.compute_returns(rewards)
-        policy_loss = []
-        for log_prob, G_t in zip(log_probs, returns):
-            policy_loss.append(-log_prob * G_t)
-        policy_loss = torch.stack(policy_loss).sum()
-
-        # backprop / gradient step
-        self.scaler.scale(policy_loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-
-        return policy_loss, swaps, sum(rewards)
-
-    def get_action(self, node_embedding) -> (int, int):
-        """
-        Based on the current environment state, get an action suggested by the agent
-        :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
-        :return: Action - index of the swap option (last option is no swap)
-        """
-        with autocast(self.device.type):
-            x = node_embedding.unsqueeze(0)
-            # transformer_output = self.transformer(x)
-            # transformer_output = transformer_output.squeeze(0)
-            transformer_output = self.transformer(x)
-            transformer_output = transformer_output.squeeze(0)
-            # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
-
-            # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
-            # as we want to output the optimal swap action
-            swap_scores = transformer_output.sum(dim=0)
-            softmax_output = torch.softmax(swap_scores, dim=-1)
-            dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
-
-            # action = torch.multinomial(softmax_output, 1)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
-
-        # print(f'Node embedding: {node_embedding}')
-        # print(f'Transformer output: {transformer_output}')
-        # print(f'Transformer output shape: {transformer_output.shape}')
-        # print(f'Swap scores: {swap_scores}')
-        # print(f'Swap scores shape: {swap_scores.shape}')
-        # print(f'Softmax output: {softmax_output}')
-        # print(f'Softmax output shape: {softmax_output.shape}')
-        # print(f'Action: {action}')
-        # print(f'Intified action: {int(action)}')
-        # print(f'Logical q0: {state.mapping[0]}')
-        # print(f'Logical q7: {state.mapping[7]}')
-
-        return action.item(), log_prob
-
     def embed_nodes(self, state: RoutingState):
         """
         Return the node embedding based on the current environment.
@@ -631,6 +568,7 @@ class AlphaRouterAgent(nn.Module):
 
             gate_vector = (embedding_q1 + embedding_q2) / 2  # Mean of qubit encodings
             gate_vector = nn.functional.pad(gate_vector, (0, 1), value=depth)  # Append depth
+
             # Pad the input with 0s so that the dimensionality is a multiple of the number of heads
             gate_vector = nn.functional.pad(gate_vector, (0, self.padding_dim), value=0)  # Append padding dimension
 
@@ -644,47 +582,41 @@ class AlphaRouterAgent(nn.Module):
 
         return torch.stack(feature_matrix)
 
+    def learn(self, total_timesteps: int, ma_window: int = 50) -> None:
+        """
+        Conduct the learning process of the agent
+        :param total_timesteps: Number of episodes during the learning process
+        :param ma_window: The size of the moving average window used for filtering out noise in the graphs
+        """
+        swaps = []
+        returns = []
 
-class ManhattanRewarder(BasicRewarder):
+        if self.device.type == 'cpu':
+            for i in range(int(total_timesteps)):
+                print(f"Episode: {i}...")
+                loss, swap, ep_return = self.episode()
+                swaps.append(swap)
+                returns.append(ep_return)
+        else:
+            for i in range(int(total_timesteps // N_ENVS)):
+                print(f"Episode: {i * N_ENVS}...")
+                loss, ep_swaps, ep_return = self.batch()
+                swaps.extend(ep_swaps)
+                returns.extend(ep_return.detach().cpu())
 
-    def __init__(self):
-        super().__init__()
+        ma_swaps = moving_average(swaps, window=ma_window)
+        ma_returns = moving_average(returns, window=ma_window)
 
-    def compute_reward(
-        self,
-        *,
-        old_state: RoutingState,
-        action: int,
-        new_state: RoutingState,
-    ) -> float:
-        interaction_circuit = new_state.interaction_circuit
-        if len(interaction_circuit) < 1:
-            return 0
-        return -np.abs(new_state.mapping[interaction_circuit[0][0]] - new_state.mapping[interaction_circuit[0][1]])
+        print(f"Success count: {self.success_count}")
+        print(f"Success %: {self.success_count / total_timesteps * 100}")
 
-class GridManhattanRewarder(BasicRewarder):
+        episodes = range(1, total_timesteps + 1)
 
-    def __init__(self, width: int):
-        super().__init__()
-        self.n = width
+        plot(episodes, swaps, label='Swaps per Episode', xlabel='Episode', ylabel='Swaps', title='Swaps per Episode')
+        plot(episodes, returns, label=f'Returns per episode', xlabel='Episode', ylabel='Return', title='Returns per episode')
+        plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title='Swaps per episode 50-Episode MA')
+        plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
 
-    def compute_reward(
-        self,
-        *,
-        old_state: RoutingState,
-        action: int,
-        new_state: RoutingState,
-    ) -> float:
-        interaction_circuit = new_state.interaction_circuit
-        if len(interaction_circuit) < 1:
-            return 0
-        q = new_state.mapping[interaction_circuit[0][0]]
-        p = new_state.mapping[interaction_circuit[0][1]]
-        n1 = q % self.n
-        n2 = p % self.n
-        m1 = q / self.n
-        m2 = p / self.n
-        return - (np.abs(n2-n1) + np.abs(m2-m1))
 
 if __name__ == '__main__':
     connection_graph = nx.Graph()
@@ -716,7 +648,7 @@ if __name__ == '__main__':
     model = AlphaRouterAgent(env, device).to(device)
 
     start = time.time()
-    model.learn(512)
+    model.learn(1024)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
