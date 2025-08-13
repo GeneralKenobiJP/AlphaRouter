@@ -253,6 +253,7 @@ class AlphaRouterAgent(nn.Module):
         self.device = device
         self.env = env
         self.env.rewarder = ManhattanRewarder()
+        # self.env.rewarder = GridManhattanRewarder(5)
         self.reward = 0
         self.episode_limit = 150  # The maximal number of steps in a single episode
         self.success_count = 0  # How many times did we achieve a successful routing during the learning process
@@ -658,10 +659,36 @@ class ManhattanRewarder(BasicRewarder):
             return 0
         return -np.abs(new_state.mapping[interaction_circuit[0][0]] - new_state.mapping[interaction_circuit[0][1]])
 
+class GridManhattanRewarder(BasicRewarder):
+
+    def __init__(self, width: int):
+        super().__init__()
+        self.n = width
+
+    def compute_reward(
+        self,
+        *,
+        old_state: RoutingState,
+        action: int,
+        new_state: RoutingState,
+    ) -> float:
+        interaction_circuit = new_state.interaction_circuit
+        if len(interaction_circuit) < 1:
+            return 0
+        q = new_state.mapping[interaction_circuit[0][0]]
+        p = new_state.mapping[interaction_circuit[0][1]]
+        n1 = q % self.n
+        n2 = p % self.n
+        m1 = q / self.n
+        m2 = p / self.n
+        return - (np.abs(n2-n1) + np.abs(m2-m1))
+
 if __name__ == '__main__':
     connection_graph = nx.Graph()
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
     connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
+    # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (5,6), (6,7), (7,8), (8,9), (10,11),(11,12),(12,13), (13,14), (0,5), (5, 10), (1, 6), (6,11), (2,7), (7,12), (3,8), (8,13), (4,9), (9,14)])
+    # width = 5
     nx.draw(connection_graph, with_labels=True)
     plt.show()
 
@@ -697,7 +724,7 @@ if __name__ == '__main__':
     # model.batch()
     # model.learn(5)
     start = time.time()
-    model.learn(256)
+    model.learn(1024)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
