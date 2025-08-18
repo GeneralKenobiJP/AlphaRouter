@@ -559,6 +559,10 @@ class AlphaRouterAgent(nn.Module):
         """
         interaction_circuit = state.interaction_circuit[:self.lookahead_length]  # Limit lookahead depth
 
+        # Pre-generate physical qubit embeddings
+        phys_qubits = torch.arange(state.n_qubits, dtype=torch.long, device=device)
+        embeddings = self.qubit_embedding(phys_qubits)
+
         feature_matrix = []
         qubit_gate_dependencies: List[Set[int]] = []
         for _ in range(state.n_qubits):
@@ -568,8 +572,8 @@ class AlphaRouterAgent(nn.Module):
             physical_q1 = state.mapping[logical_q1]
             physical_q2 = state.mapping[logical_q2]
 
-            embedding_q1 = self.qubit_embedding(torch.tensor(physical_q1, device=self.device))
-            embedding_q2 = self.qubit_embedding(torch.tensor(physical_q2, device=self.device))
+            embedding_q1 = embeddings[physical_q1]
+            embedding_q2 = embeddings[physical_q2]
 
             gate_dependencies = qubit_gate_dependencies[logical_q1].union(qubit_gate_dependencies[logical_q2])
             depth = len(gate_dependencies) + 1
@@ -595,6 +599,7 @@ class AlphaRouterAgent(nn.Module):
         Conduct the learning process of the agent
         :param total_timesteps: Number of episodes during the learning process
         :param ma_window: The size of the moving average window used for filtering out noise in the graphs
+        :batch: If true - computes in batches with B=N_ENV
         """
         swaps = []
         returns = []
