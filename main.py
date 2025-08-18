@@ -4,6 +4,7 @@ from collections import deque
 from typing import List, Set, Union
 
 import networkx as nx
+import numpy as np
 import torch
 from qgym.envs import Routing
 from qgym.envs.routing import RoutingState
@@ -23,12 +24,14 @@ from manhattan_rewarder import ManhattanRewarder
 
 from gymnasium.vector import SyncVectorEnv
 
+from utils import NormalizeInfoWrapper
+
 EMBEDDING_DIM = 20      # AR paper embedding dimension
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length
 NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
 FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
-N_ENVS: int = 32
+N_ENVS: int = 64
 
 def render_rgb(env):
     """Convenience method that we will use later on to display our results. Copied from notebooks"""
@@ -51,6 +54,7 @@ def make_env(connection_graph, rewarder=None):
             interaction_generator=CustomInteractionGenerator()
         )
         # env.seed(seed)
+        env = NormalizeInfoWrapper(env)
         return env
     return _thunk
 
@@ -485,18 +489,31 @@ class AlphaRouterAgent(nn.Module):
 
             actions, log_probs = self.get_action(state_embeddings)
 
-            for i in range(N_ENVS):
-                if done_list[i] is True:
-                    continue
-                observations, reward, terminated, truncated, info = self.vec_env.envs[i].step(actions[i])
-                done = terminated or truncated
+            observations, rewards, terminated, truncated, info = self.vec_env.step(actions.cpu().tolist())
+            done = np.logical_or(terminated, truncated)
 
-                if done:
+            for i in range(N_ENVS):
+                if done_list[i]:
+                    continue
+                if done[i]:
                     done_list[i] = True
                     swaps[i] = step_idx
                     self.success_count += 1
                 log_prob_list[i].append(log_probs[i])
-                reward_list[i].append(reward)
+                reward_list[i].append(rewards[i])
+
+            # for i in range(N_ENVS):
+            #     if done_list[i] is True:
+            #         continue
+            #     observations, reward, terminated, truncated, info = self.vec_env.envs[i].step(actions[i])
+            #     done = terminated or truncated
+            #
+            #     if done:
+            #         done_list[i] = True
+            #         swaps[i] = step_idx
+            #         self.success_count += 1
+            #     log_prob_list[i].append(log_probs[i])
+            #     reward_list[i].append(reward)
 
             new_embeddings = torch.stack(
                 [self.embed_nodes(env._state) for env in self.vec_env.envs],
@@ -582,7 +599,7 @@ class AlphaRouterAgent(nn.Module):
 
         return torch.stack(feature_matrix)
 
-    def learn(self, total_timesteps: int, ma_window: int = 50) -> None:
+    def learn(self, total_timesteps: int, ma_window: int = 50, batch: bool = True) -> None:
         """
         Conduct the learning process of the agent
         :param total_timesteps: Number of episodes during the learning process
@@ -591,7 +608,7 @@ class AlphaRouterAgent(nn.Module):
         swaps = []
         returns = []
 
-        if self.device.type == 'cpu':
+        if not batch:
             for i in range(int(total_timesteps)):
                 print(f"Episode: {i}...")
                 loss, swap, ep_return = self.episode()
@@ -643,7 +660,7 @@ if __name__ == '__main__':
     print(f"device count: {torch.cuda.device_count()}")  # number of GPUs
     print(f"devices: {torch.cuda.get_device_name}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cpu")
+    device = torch.device("cpu")
     print(f"device: {device}")
     model = AlphaRouterAgent(env, device).to(device)
 
@@ -656,3 +673,18 @@ if __name__ == '__main__':
     print("Gradients flowing:", has_grad)
 
     print('Successful execution')
+    # B = 32
+    # 165.20124554634094
+    # 104.16623425483704
+
+    # Before vectorization (B = 64)
+    # 162.52327227592468
+    # 96.18174529075623
+
+    # After vectorization (B = 64)
+    # 147.20666241645813
+    # 98.53906488418579
+
+    # B = 128
+    # 131.8683156967163
+    # 90.94579315185547
