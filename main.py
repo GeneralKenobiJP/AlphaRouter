@@ -79,8 +79,6 @@ class PositionalEncoding(nn.Module):
         # Rounded up to the nearest even number so that odd indices slicing works
         final_embedding_dim_even = embedding_dim if embedding_dim % 2 == 0 else embedding_dim - 1
         pe[:, 1::2] = torch.cos(position * div_term[::final_embedding_dim_even])
-        print(f'Final_embedding_dim: {embedding_dim}')
-        print(f'Final_embedding_dim_even: {final_embedding_dim_even}')
         self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -191,13 +189,19 @@ class ReplayBuffer:
         We detach and move everything to CPU to avoid pinning GPU memory.
         """
         # ensure everything is on CPU and detached
-        stored_state = state.detach().to(self.device)
+        stored_state = state.detach()
         stored_action = (action.detach() if isinstance(action, torch.Tensor)
-              else torch.tensor(action, dtype=torch.int, device=self.device))
-        stored_reward = torch.tensor(reward, dtype=torch.float32, device=self.device)
-        stored_next_state = next_state.detach().to(self.device)
-        stored_done = torch.tensor(done, dtype=torch.float32, device=self.device)
-        self.buffer.append((stored_state, stored_action, stored_reward, stored_next_state, stored_done))
+                         else action)
+        stored_next_state = next_state.detach()
+        self.buffer.append((stored_state, stored_action, reward, stored_next_state, done))
+
+        # stored_state = state.detach().to(self.device)
+        # stored_action = (action.detach() if isinstance(action, torch.Tensor)
+        #       else torch.tensor(action, dtype=torch.int, device=self.device))
+        # stored_reward = torch.tensor(reward, dtype=torch.float32, device=self.device)
+        # stored_next_state = next_state.detach().to(self.device)
+        # stored_done = torch.tensor(done, dtype=torch.float32, device=self.device)
+        # self.buffer.append((stored_state, stored_action, stored_reward, stored_next_state, stored_done))
 
     def sample(self, batch_size: int):
         """
@@ -212,11 +216,11 @@ class ReplayBuffer:
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        states = torch.stack(states, dim=0)
-        actions = torch.stack(actions, dim=0)
-        rewards = torch.stack(rewards, dim=0)
-        next_states = torch.stack(next_states, dim=0)
-        dones = torch.stack(dones, dim=0)
+        states = torch.stack(states, dim=0).to(device)
+        actions = torch.stack(actions, dim=0).to(device)
+        rewards = torch.stack(rewards, dim=0).to(device)
+        next_states = torch.stack(next_states, dim=0).to(device)
+        dones = torch.stack(dones, dim=0).to(device)
 
         return states, actions, rewards, next_states, dones
 
@@ -489,7 +493,7 @@ class AlphaRouterAgent(nn.Module):
 
             actions, log_probs = self.get_action(state_embeddings)
 
-            observations, rewards, terminated, truncated, info = self.vec_env.step(actions.cpu().tolist())
+            observations, rewards, terminated, truncated, info = self.vec_env.step(actions)
             done = np.logical_or(terminated, truncated)
 
             for i in range(N_ENVS):
@@ -501,19 +505,6 @@ class AlphaRouterAgent(nn.Module):
                     self.success_count += 1
                 log_prob_list[i].append(log_probs[i])
                 reward_list[i].append(rewards[i])
-
-            # for i in range(N_ENVS):
-            #     if done_list[i] is True:
-            #         continue
-            #     observations, reward, terminated, truncated, info = self.vec_env.envs[i].step(actions[i])
-            #     done = terminated or truncated
-            #
-            #     if done:
-            #         done_list[i] = True
-            #         swaps[i] = step_idx
-            #         self.success_count += 1
-            #     log_prob_list[i].append(log_probs[i])
-            #     reward_list[i].append(reward)
 
             new_embeddings = torch.stack(
                 [self.embed_nodes(env._state) for env in self.vec_env.envs],
@@ -660,7 +651,7 @@ if __name__ == '__main__':
     print(f"device count: {torch.cuda.device_count()}")  # number of GPUs
     print(f"devices: {torch.cuda.get_device_name}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
+    # device = torch.device("cpu")
     print(f"device: {device}")
     model = AlphaRouterAgent(env, device).to(device)
 
