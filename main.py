@@ -26,7 +26,7 @@ from manhattan_rewarder import ManhattanRewarder
 from gymnasium.vector import SyncVectorEnv
 
 from transformer import Transformer
-from utils import NormalizeInfoWrapper
+from utils import NormalizeInfoWrapper, embed_nodes
 
 EMBEDDING_DIM = 20      # AR paper embedding dimension
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length
@@ -172,7 +172,10 @@ class AlphaRouterAgent(nn.Module):
             buffer_size,
             self.device
         )
-        self.mcts = MCTS(None, make_env(connection_graph, ManhattanRewarder())(), self.transformer, swap_options=len(connection_graph.edges) + 1)
+        self.mcts = MCTS(None, make_env(connection_graph, ManhattanRewarder())(), self.transformer,
+                         self.qubit_embedding, self.device, swap_options=len(connection_graph.edges) + 1,
+                         lookahead_length=self.lookahead_length, embedding_dim=self.embedding_dim,
+                         padding_dim=self.padding_dim)
 
         self.to(self.device)
 
@@ -331,13 +334,15 @@ class AlphaRouterAgent(nn.Module):
         rewards = []
 
         swaps = 0
-        state_embedding = self.embed_nodes(self.env._state)
+        state_embedding = embed_nodes(self.env._state, self.lookahead_length, self.device,
+                                      self.qubit_embedding, self.embedding_dim, self.padding_dim)
 
         for _ in range(self.episode_limit):
             action, log_prob = self.get_action(state_embedding.unsqueeze(0))
             observation, reward, done, truncated, info = self.env.step(action)
 
-            new_embedding = self.embed_nodes(self.env._state)
+            new_embedding = embed_nodes(self.env._state, self.lookahead_length, self.device,
+                                      self.qubit_embedding, self.embedding_dim, self.padding_dim)
             self.replay_buffer.store(state_embedding, action, reward, new_embedding, done)
             state_embedding = new_embedding
 
@@ -390,7 +395,8 @@ class AlphaRouterAgent(nn.Module):
         self.optimizer.zero_grad()
 
         state_embeddings = torch.stack(
-            [self.embed_nodes(env._state) for env in self.vec_env.envs],
+            [embed_nodes(env._state, self.lookahead_length, self.device, self.qubit_embedding,
+                              self.embedding_dim, self.padding_dim) for env in self.vec_env.envs],
             dim=0
         ).to(self.device)
 
@@ -417,7 +423,8 @@ class AlphaRouterAgent(nn.Module):
                 reward_list[i].append(rewards[i])
 
             new_embeddings = torch.stack(
-                [self.embed_nodes(env._state) for env in self.vec_env.envs],
+                [embed_nodes(env._state, self.lookahead_length, self.device, self.qubit_embedding,
+                                  self.embedding_dim, self.padding_dim) for env in self.vec_env.envs],
                 dim=0
             ).to(self.device)
 
@@ -450,59 +457,7 @@ class AlphaRouterAgent(nn.Module):
 
         return policy_loss, swaps, undiscounted_returns
 
-    def embed_nodes(self, state: RoutingState):
-        """
-        Return the node embedding based on the current environment.
 
-        We observe a maximum of self.lookahead_length gates and for each gate we produce a gate embedding in the following way:
-        - We retrieve logical qubits involved in the gate
-        - We retrieve physical qubits mapped to the logical qubits
-        - For each physical qubit we produce a qubit embedding with nn.Embedding
-        - We take a mean of these two qubit embeddings
-        - We concatenate this embedding with the depth of the gate, where depth is equal to the number of another gates
-            this gate depends on + 1
-        - We pad the embedding so that the length of the embedding is divisible by the number of the attention heads
-
-        This procedure yields a node embedding matrix of shape (Lookahead Length x (Embedding Dimension + 1))
-
-        :return: Node embedding
-        """
-        interaction_circuit = state.interaction_circuit[:self.lookahead_length]  # Limit lookahead depth
-
-        # Pre-generate physical qubit embeddings
-        phys_qubits = torch.arange(state.n_qubits, dtype=torch.long, device=device)
-        embeddings = self.qubit_embedding(phys_qubits)
-
-        feature_matrix = []
-        qubit_gate_dependencies: List[Set[int]] = []
-        for _ in range(state.n_qubits):
-            qubit_gate_dependencies.append(set())
-
-        for idx, (logical_q1, logical_q2) in enumerate(interaction_circuit):
-            physical_q1 = state.mapping[logical_q1]
-            physical_q2 = state.mapping[logical_q2]
-
-            embedding_q1 = embeddings[physical_q1]
-            embedding_q2 = embeddings[physical_q2]
-
-            gate_dependencies = qubit_gate_dependencies[logical_q1].union(qubit_gate_dependencies[logical_q2])
-            depth = len(gate_dependencies) + 1
-
-            gate_vector = (embedding_q1 + embedding_q2) / 2  # Mean of qubit encodings
-            gate_vector = nn.functional.pad(gate_vector, (0, 1), value=depth)  # Append depth
-
-            # Pad the input with 0s so that the dimensionality is a multiple of the number of heads
-            gate_vector = nn.functional.pad(gate_vector, (0, self.padding_dim), value=0)  # Append padding dimension
-
-            qubit_gate_dependencies[logical_q1].add(idx)
-            qubit_gate_dependencies[logical_q2].add(idx)
-
-            feature_matrix.append(gate_vector)
-
-        if len(feature_matrix) == 0:
-            return torch.zeros((self.lookahead_length, self.embedding_dim + 1), device=self.device)
-
-        return torch.stack(feature_matrix)
 
     def learn(self, total_timesteps: int, ma_window: int = 50, batch: bool = True) -> None:
         """
@@ -566,12 +521,13 @@ if __name__ == '__main__':
     print(f"device count: {torch.cuda.device_count()}")  # number of GPUs
     print(f"devices: {torch.cuda.get_device_name}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
+    # device = torch.device("cpu")
     print(f"device: {device}")
     model = AlphaRouterAgent(env, device).to(device)
 
     start = time.time()
     model.learn(64, batch=False)
+    # model.learn(1024, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
