@@ -1,6 +1,8 @@
 import math
+import sys
 import time
 from collections import deque
+from copy import deepcopy
 from typing import List, Set, Union
 
 import networkx as nx
@@ -79,53 +81,44 @@ class ReplayBuffer:
         self.buffer   = deque(maxlen=capacity)
 
     def store(self,
-              state: torch.Tensor,
+              state: RoutingState,
               action: Union[int, torch.Tensor],
               reward: float,
-              next_state: torch.Tensor,
+              next_state: RoutingState,
               done: bool):
         """
         Stores an experience.
         We detach and move everything to CPU to avoid pinning GPU memory.
         """
         # ensure everything is on CPU and detached
-        stored_state = state.detach()
         stored_action = (action.detach() if isinstance(action, torch.Tensor)
                          else action)
-        stored_next_state = next_state.detach()
-        self.buffer.append((stored_state, stored_action, reward, stored_next_state, done))
-
-        # stored_state = state.detach().to(self.device)
-        # stored_action = (action.detach() if isinstance(action, torch.Tensor)
-        #       else torch.tensor(action, dtype=torch.int, device=self.device))
-        # stored_reward = torch.tensor(reward, dtype=torch.float32, device=self.device)
-        # stored_next_state = next_state.detach().to(self.device)
-        # stored_done = torch.tensor(done, dtype=torch.float32, device=self.device)
-        # self.buffer.append((stored_state, stored_action, stored_reward, stored_next_state, stored_done))
+        self.buffer.append((state, stored_action, reward, deepcopy(next_state), done))
 
     def sample(self, batch_size: int):
         """
         Samples a batch of transitions, returning:
             states:     float32 tensor (B, *state_shape)
             actions:    int    tensor (B,)
-            rewards:    float32 tensor (B,)
+            rewards:    float (B,)
             next_states float32 tensor (B, *state_shape)
-            dones:      float32 tensor (B,)
+            dones:      bool (B,)
         all moved to self.device.
         """
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        states = torch.stack(states, dim=0).to(device)
-        actions = torch.stack(actions, dim=0).to(device)
-        rewards = torch.stack(rewards, dim=0).to(device)
-        next_states = torch.stack(next_states, dim=0).to(device)
-        dones = torch.stack(dones, dim=0).to(device)
+        states = deepcopy(states[0])
+        actions = actions[0].to(self.device)
+        rewards = rewards[0]
+        next_states = deepcopy(next_states[0])
+        dones = dones[0]
 
         return states, actions, rewards, next_states, dones
 
     def __len__(self):
         return len(self.buffer)
+
 
 class AlphaRouterAgent(nn.Module):
     """The AlphaRouter routing agent"""
@@ -172,10 +165,10 @@ class AlphaRouterAgent(nn.Module):
             buffer_size,
             self.device
         )
-        self.mcts = MCTS(None, make_env(connection_graph, ManhattanRewarder())(), self.transformer,
+        self.mcts = MCTS(make_env(connection_graph, ManhattanRewarder())(), self.transformer,
                          self.qubit_embedding, self.device, swap_options=len(connection_graph.edges) + 1,
                          lookahead_length=self.lookahead_length, embedding_dim=self.embedding_dim,
-                         padding_dim=self.padding_dim)
+                         padding_dim=self.padding_dim, rollouts=15, max_depth=100)
 
         self.to(self.device)
 
@@ -334,17 +327,16 @@ class AlphaRouterAgent(nn.Module):
         rewards = []
 
         swaps = 0
-        state_embedding = embed_nodes(self.env._state, self.lookahead_length, self.device,
-                                      self.qubit_embedding, self.embedding_dim, self.padding_dim)
 
         for _ in range(self.episode_limit):
+            old_state = deepcopy(self.env._state)
+
+            state_embedding = embed_nodes(self.env._state, self.lookahead_length, self.device,
+                                          self.qubit_embedding, self.embedding_dim, self.padding_dim)
             action, log_prob = self.get_action(state_embedding.unsqueeze(0))
             observation, reward, done, truncated, info = self.env.step(action)
 
-            new_embedding = embed_nodes(self.env._state, self.lookahead_length, self.device,
-                                      self.qubit_embedding, self.embedding_dim, self.padding_dim)
-            self.replay_buffer.store(state_embedding, action, reward, new_embedding, done)
-            state_embedding = new_embedding
+            self.replay_buffer.store(old_state, action, reward, self.env._state, done)
 
             log_probs.append(log_prob)
             rewards.append(reward)
@@ -353,15 +345,6 @@ class AlphaRouterAgent(nn.Module):
             if done:
                 self.success_count += 1
                 break
-
-            # MCTS
-            # if not len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
-            #     continue
-            # mcts_input = self.replay_buffer.sample(1)
-            mcts_input = self.env._state
-            # self.mcts.run(Node(mcts_input[0]))
-            self.mcts.run(Node(mcts_input))
-
 
         returns = self.compute_returns(rewards)
         policy_loss = []
@@ -373,6 +356,21 @@ class AlphaRouterAgent(nn.Module):
         self.scaler.scale(policy_loss).backward()
         self.scaler.step(self.optimizer)
         self.scaler.update()
+
+        # MCTS
+        self.optimizer.zero_grad()
+        # if not len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
+        #     continue
+        mcts_input = self.replay_buffer.sample(1)
+        # mcts_input = self.env._state
+        # self.mcts.run(Node(mcts_input[0]))
+        mcts_reward = self.mcts.run(mcts_input[0])
+        # if mcts_reward is not None:
+
+            # MCTS backprop / gradient step
+            # self.scaler.scale(mcts_reward).backward()
+            # self.scaler.step(self.optimizer)
+            # self.scaler.update()
 
         return policy_loss, swaps, sum(rewards)
 

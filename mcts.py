@@ -121,7 +121,7 @@ class MCTS:
         # log_prob: Tensor = dist.log_prob(action)
 
         dist = torch.distributions.Uniform(len(leaf_node.children.values()), self.swap_options)
-        action = dist.sample()
+        action = dist.sample().int()
         log_prob: Tensor = dist.log_prob(action)
 
         state = deepcopy(leaf_node.state)
@@ -217,27 +217,19 @@ class MCTS:
     def run(self, root_state: RoutingState) -> Tensor:
         self.set_root(root_state)
 
-        print('a')
         returns = []
-        for _ in range(self.rollouts):
+
+        for idx in range(self.rollouts):
             leaf_node, is_terminal, path_states, path_actions = self.select(self.root)
-            print('b')
             if is_terminal:
-                print('terminal')
                 self.backpropagate(path_states, path_actions, leaf_node.value)
                 returns.append(torch.tensor(leaf_node.value, device=self.device))
 
-            print('c')
-
             node, action, log_prob = self.expand(leaf_node)
-            print('d')
             path_states.append(node.state)
-            print('e')
             path_actions.append(action)
-            print('f')
 
             reward = self.simulate(node)
-            print('g')
 
             self.backpropagate(path_states, path_actions, reward)
 
