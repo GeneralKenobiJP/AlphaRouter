@@ -39,9 +39,9 @@ class Node:
 
 class MCTS:
     def __init__(self, env: Routing, transformer: Transformer, qubit_embedding: nn.Embedding,
-                 device: Device, swap_options: int, c: float = math.sqrt(2), rollouts: int = 200, max_depth: int = 150,
+                 device: Device, swap_options: int, c: float = math.sqrt(2), rollouts: int = 200, max_depth: int = 100,
                  lookahead_length: int = 48, embedding_dim: int = 24, padding_dim: int = 3):
-        self.root = None
+        self.root: Node | None = None
         self.transposition_table = dict()
         self.c_constant = c
         self.swap_options = swap_options
@@ -79,14 +79,14 @@ class MCTS:
 
     def select(self, root: Node) -> (Node, bool, list[RoutingState], list[int]):
         node = root
-        path_states = []
-        path_actions = []
+        path_states = [root.state]
+        path_actions = [0] # dummy 0 action to make the states dim and actions dim match (root does not need any action)
 
         while not node.is_terminal():
             if node.is_exhausted(self.swap_options):
                 node, action = self.select_child(node)
                 path_states.append(node.state)
-                path_actions.append(node.value)
+                path_actions.append(action)
             else:
                 return node, False, path_states, path_actions
         return node, True, path_states, path_actions
@@ -120,16 +120,17 @@ class MCTS:
         # action = torch.tensor(actions_rmaining[dist.sample()])
         # log_prob: Tensor = dist.log_prob(action)
 
-        dist = torch.distributions.Uniform(len(leaf_node.children.values()), self.swap_options)
-        action = dist.sample().int()
-        log_prob: Tensor = dist.log_prob(action)
+        # dist = torch.distributions.Uniform(len(leaf_node.children.values()), self.swap_options)
+        # action = dist.sample().int()
+        action = torch.tensor(len(leaf_node.children.values()), dtype=int)
+        # log_prob: Tensor = dist.log_prob(action)
 
         state = deepcopy(leaf_node.state)
         state.update_state(action.item())
 
         node = self.add_child(leaf_node, action, state)
 
-        return node, action, log_prob
+        return node, action, 0
 
     def get_action(self, node_embedding) -> (Tensor, Tensor):
         """
@@ -212,7 +213,7 @@ class MCTS:
         for (state, action) in zip(path_states, path_actions):
             node = self.get_transposition(gen_hash(state))
             node.visits += 1
-            node.value += reward
+            node.value += reward.item()
 
     def run(self, root_state: RoutingState) -> Tensor:
         self.set_root(root_state)
