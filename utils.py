@@ -1,7 +1,12 @@
 from collections import deque
+from typing import List, Set
 
 import numpy as np
+import torch
 from gymnasium import Wrapper
+from qgym.envs.routing import RoutingState
+from torch import nn
+from torch.types import Device
 
 
 def _make_python_safe(obj):
@@ -46,3 +51,59 @@ class NormalizeInfoWrapper(Wrapper):
         # delegate to inner env
         # .env should exist because Wrapper provides it
         return getattr(self.env, '_state')
+
+
+def embed_nodes(state: RoutingState, lookahead_length: int, device: Device, qubit_embedding: nn.Embedding,
+                embedding_dim: int, padding_dim: int):
+    """
+    Return the node embedding based on the current environment.
+
+    We observe a maximum of self.lookahead_length gates and for each gate we produce a gate embedding in the following way:
+    - We retrieve logical qubits involved in the gate
+    - We retrieve physical qubits mapped to the logical qubits
+    - For each physical qubit we produce a qubit embedding with nn.Embedding
+    - We take a mean of these two qubit embeddings
+    - We concatenate this embedding with the depth of the gate, where depth is equal to the number of another gates
+        this gate depends on + 1
+    - We pad the embedding so that the length of the embedding is divisible by the number of the attention heads
+
+    This procedure yields a node embedding matrix of shape (Lookahead Length x (Embedding Dimension + 1))
+
+    :return: Node embedding
+    """
+    interaction_circuit = state.interaction_circuit[:lookahead_length]  # Limit lookahead depth
+
+    # Pre-generate physical qubit embeddings
+    phys_qubits = torch.arange(state.n_qubits, dtype=torch.long, device=device)
+    embeddings = qubit_embedding(phys_qubits)
+
+    feature_matrix = []
+    qubit_gate_dependencies: List[Set[int]] = []
+    for _ in range(state.n_qubits):
+        qubit_gate_dependencies.append(set())
+
+    for idx, (logical_q1, logical_q2) in enumerate(interaction_circuit):
+        physical_q1 = state.mapping[logical_q1]
+        physical_q2 = state.mapping[logical_q2]
+
+        embedding_q1 = embeddings[physical_q1]
+        embedding_q2 = embeddings[physical_q2]
+
+        gate_dependencies = qubit_gate_dependencies[logical_q1].union(qubit_gate_dependencies[logical_q2])
+        depth = len(gate_dependencies) + 1
+
+        gate_vector = (embedding_q1 + embedding_q2) / 2  # Mean of qubit encodings
+        gate_vector = nn.functional.pad(gate_vector, (0, 1), value=depth)  # Append depth
+
+        # Pad the input with 0s so that the dimensionality is a multiple of the number of heads
+        gate_vector = nn.functional.pad(gate_vector, (0, padding_dim), value=0)  # Append padding dimension
+
+        qubit_gate_dependencies[logical_q1].add(idx)
+        qubit_gate_dependencies[logical_q2].add(idx)
+
+        feature_matrix.append(gate_vector)
+
+    if len(feature_matrix) == 0:
+        return torch.zeros((lookahead_length, embedding_dim), device=device)
+
+    return torch.stack(feature_matrix)

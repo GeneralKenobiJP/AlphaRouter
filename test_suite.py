@@ -1,9 +1,17 @@
+from copy import deepcopy
+
+import networkx as nx
 import pytest
 import torch
 import numpy as np
-from torch import nn
+from qgym.envs import Routing
+from torch import nn, Tensor, tensor
 
-from main import PositionalEncoding, TransformerLayer, Transformer, ReplayBuffer, ManhattanRewarder, AlphaRouterAgent
+from custom_interaction_generator import CustomInteractionGenerator
+from main import ReplayBuffer, ManhattanRewarder, AlphaRouterAgent, \
+    LOOKAHEAD_LENGTH
+from mcts import MCTS, gen_hash
+from transformer import PositionalEncoding, TransformerLayer, Transformer
 
 
 # --- PositionalEncoding tests ---
@@ -141,3 +149,93 @@ def test_embed_nodes_basic():
 #     action, logp = agent.get_action(fake_embedding)
 #     assert isinstance(action, int) and 0 <= action < 4
 #     assert isinstance(logp, torch.Tensor) and logp.dim() == 0
+
+def test_mcts():
+    connection_graph = nx.Graph()
+    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)])
+
+    env = Routing(
+        max_observation_reach=LOOKAHEAD_LENGTH,
+        observe_legal_surpasses=True,
+        observe_connection_graph=True,
+        connection_graph=connection_graph,
+        render_mode="rgb_array",
+        rewarder=None,
+        interaction_generator=CustomInteractionGenerator()
+    )
+
+    embedding_dim = 8
+    num_heads = 2
+    ffn_dim = 16
+    num_layers = 1
+    lookahead = 5
+    swap_options = 7
+    transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead, swap_options)
+    device = torch.device("cpu")
+    qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(),
+                                            embedding_dim=embedding_dim-1).to(device)
+
+    mcts = MCTS(env=env, transformer=transformer, qubit_embedding=qubit_embedding, device=device,
+                swap_options=swap_options, max_depth=5, lookahead_length=lookahead, embedding_dim=embedding_dim,padding_dim=0)
+
+    root = deepcopy(env._state)
+
+    assert len(mcts.transposition_table) == 0
+
+    mcts.set_root(root)
+    assert len(mcts.transposition_table) == 1
+    assert mcts.root.state == root
+    assert mcts.root.value == 0
+    assert mcts.root.visits == 0
+    assert len(mcts.root.children) == 0
+    assert mcts.transposition_table[gen_hash(root)] == mcts.root
+
+    node, action = mcts.expand(mcts.root)
+    assert len(mcts.transposition_table) == 2
+    assert mcts.root.state == root
+    assert mcts.root.value == 0
+    assert mcts.root.visits == 0
+    assert len(mcts.root.children) == 1
+    assert mcts.root.children[node] == 0
+    assert node.value == 0
+    assert node.visits == 0
+    assert len(node.children) == 0
+    assert action == 0
+
+    reward = mcts.simulate(node)
+    assert reward is not None
+
+    path_states = [mcts.root.state, node.state]
+    path_actions = [0, 0]
+    mcts.backpropagate(path_states, path_actions, reward)
+
+    assert len(mcts.transposition_table) == 2
+    assert mcts.root.state == root
+    assert mcts.root.value == reward.item()
+    assert mcts.root.visits == 1
+    assert len(mcts.root.children) == 1
+    assert mcts.root.children[node] == 0
+    assert node.value == reward
+    assert node.visits == 1
+    assert len(node.children) == 0
+
+    assert mcts.transposition_table[gen_hash(root)] == mcts.root
+    assert mcts.transposition_table[gen_hash(node.state)] == node
+
+    best_action = mcts.run(deepcopy(node.state))
+    assert len(mcts.transposition_table) > 2
+    assert mcts.root.state == node.state
+    assert node.visits > 1
+    assert len(node.children) > 0
+    assert 0 <= best_action < swap_options
+
+    max_val = -np.inf
+    for child in mcts.root.children:
+        if child.value > max_val:
+            max_val = child.value
+
+    for child in mcts.root.children:
+        if mcts.root.children[child] == best_action:
+            assert child.value == max_val
+        else:
+            assert child.value <= max_val

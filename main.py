@@ -1,6 +1,8 @@
 import math
+import sys
 import time
 from collections import deque
+from copy import deepcopy
 from typing import List, Set, Union
 
 import networkx as nx
@@ -19,12 +21,14 @@ from torch.types import Device
 from torchviz import make_dot
 
 from custom_interaction_generator import CustomInteractionGenerator
+from mcts import MCTS, Node
 from plotting import moving_average, plot
 from manhattan_rewarder import ManhattanRewarder
 
 from gymnasium.vector import SyncVectorEnv
 
-from utils import NormalizeInfoWrapper
+from transformer import Transformer
+from utils import NormalizeInfoWrapper, embed_nodes
 
 EMBEDDING_DIM = 20      # AR paper embedding dimension
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length
@@ -32,6 +36,8 @@ NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
 FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
+
+REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 
 def render_rgb(env):
     """Convenience method that we will use later on to display our results. Copied from notebooks"""
@@ -59,110 +65,6 @@ def make_env(connection_graph, rewarder=None):
     return _thunk
 
 
-class PositionalEncoding(nn.Module):
-    """
-    A positional encoding module.
-    Takes in node embedding and adds positional information.
-    """
-    def __init__(self, embedding_dim=24, lookahead_length=48):
-        """
-        :param embedding_dim: Embedding dimension of the (padded) node embeddings
-        :param lookahead_length: The maximal number of the gates ahead that we will analyze
-        """
-        super().__init__()
-
-        position = torch.arange(lookahead_length, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, embedding_dim, 2, dtype=torch.float32) * (-math.log(1e5) / embedding_dim))
-        pe = torch.zeros(lookahead_length, embedding_dim)
-        pe[:, 0::2] = torch.sin(position * div_term)
-
-        # Rounded up to the nearest even number so that odd indices slicing works
-        final_embedding_dim_even = embedding_dim if embedding_dim % 2 == 0 else embedding_dim - 1
-        pe[:, 1::2] = torch.cos(position * div_term[::final_embedding_dim_even])
-        self.register_buffer('pe', pe)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Applies the positional encoding
-        :param x: input tensor
-        """
-        x = x + self.pe[:x.size(1)].unsqueeze(0)
-        return x
-
-
-class TransformerLayer(nn.Module):
-    """
-    A single instance of Transformer layer of structure:
-    - Multihead attention
-    - Add & norm layer
-    - Feed-forward network
-    - Add & norm layer
-    """
-    def __init__(self, embedding_dim, num_heads, ffn_dim):
-        """
-        :param embedding_dim: Embedding dimension of the node embeddings
-        :param num_heads: Number of heads in a multihead attention layer
-        :param ffn_dim: Dimensionality of the hidden layer in the feed forward layer
-        """
-        super().__init__()
-
-        self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
-        self.norm1 = nn.LayerNorm(embedding_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(embedding_dim, ffn_dim),
-            nn.ReLU(),
-            nn.Linear(ffn_dim, embedding_dim)
-        )
-        self.norm2 = nn.LayerNorm(embedding_dim)
-
-    def forward(self, x):
-        """
-        Applies the transformer layer
-        :param x: input tensor
-        """
-        attention_output, _ = self.multihead_attention(x, x, x)
-        x = self.norm1(x + attention_output)
-        ffn_output = self.ffn(x)
-        x = self.norm2(x + ffn_output)
-        return x
-
-
-class Transformer(nn.Module):
-    """
-    Complete transformer encoder used in the agent with linear decoder
-    """
-    def __init__(self, embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length, swap_options):
-        """
-        :param embedding_dim: Embedding dimension of the node embeddings (with the padding and depth)
-        :param num_heads: Number of heads in a multihead attention layer
-        :param ffn_dim: Dimensionality of the hidden layer in the feed forward layer
-        :param num_layers: Number of transformer layers
-        :param lookahead_length: The maximal number of the gates ahead that we will analyze
-        :param swap_options: Number of possible swaps actions + 1 (to include no swap)
-        """
-        super().__init__()
-
-        self.positional_encoding = PositionalEncoding(embedding_dim, lookahead_length)
-
-        self.layers = nn.ModuleList([
-            TransformerLayer(embedding_dim, num_heads, ffn_dim) for _ in range(num_layers)
-        ])
-
-        # Linear decoder that outputs the matrix of shape (number_of_logical_gates x number_of_swap_options)
-        self.decoder = nn.Linear(embedding_dim, swap_options)
-
-    def forward(self, x):
-        """
-        Pads the input accordingly, applies the transformer encoder and linear decoder
-        :param x: input tensor
-        """
-        x = self.positional_encoding(x)
-
-        for layer in self.layers:
-            x = layer(x)
-        return self.decoder(x)
-
-
 class ReplayBuffer:
     """
     A simple replay buffer for standard RL:
@@ -179,53 +81,44 @@ class ReplayBuffer:
         self.buffer   = deque(maxlen=capacity)
 
     def store(self,
-              state: torch.Tensor,
+              state: RoutingState,
               action: Union[int, torch.Tensor],
               reward: float,
-              next_state: torch.Tensor,
+              next_state: RoutingState,
               done: bool):
         """
         Stores an experience.
         We detach and move everything to CPU to avoid pinning GPU memory.
         """
         # ensure everything is on CPU and detached
-        stored_state = state.detach()
         stored_action = (action.detach() if isinstance(action, torch.Tensor)
                          else action)
-        stored_next_state = next_state.detach()
-        self.buffer.append((stored_state, stored_action, reward, stored_next_state, done))
-
-        # stored_state = state.detach().to(self.device)
-        # stored_action = (action.detach() if isinstance(action, torch.Tensor)
-        #       else torch.tensor(action, dtype=torch.int, device=self.device))
-        # stored_reward = torch.tensor(reward, dtype=torch.float32, device=self.device)
-        # stored_next_state = next_state.detach().to(self.device)
-        # stored_done = torch.tensor(done, dtype=torch.float32, device=self.device)
-        # self.buffer.append((stored_state, stored_action, stored_reward, stored_next_state, stored_done))
+        self.buffer.append((state, stored_action, reward, deepcopy(next_state), done))
 
     def sample(self, batch_size: int):
         """
         Samples a batch of transitions, returning:
             states:     float32 tensor (B, *state_shape)
             actions:    int    tensor (B,)
-            rewards:    float32 tensor (B,)
+            rewards:    float (B,)
             next_states float32 tensor (B, *state_shape)
-            dones:      float32 tensor (B,)
+            dones:      bool (B,)
         all moved to self.device.
         """
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        states = torch.stack(states, dim=0).to(device)
-        actions = torch.stack(actions, dim=0).to(device)
-        rewards = torch.stack(rewards, dim=0).to(device)
-        next_states = torch.stack(next_states, dim=0).to(device)
-        dones = torch.stack(dones, dim=0).to(device)
+        states = deepcopy(states[0])
+        actions = actions[0].to(self.device)
+        rewards = rewards[0]
+        next_states = deepcopy(next_states[0])
+        dones = dones[0]
 
         return states, actions, rewards, next_states, dones
 
     def __len__(self):
         return len(self.buffer)
+
 
 class AlphaRouterAgent(nn.Module):
     """The AlphaRouter routing agent"""
@@ -272,6 +165,10 @@ class AlphaRouterAgent(nn.Module):
             buffer_size,
             self.device
         )
+        self.mcts = MCTS(make_env(connection_graph, ManhattanRewarder())(), self.transformer,
+                         self.qubit_embedding, self.device, swap_options=len(connection_graph.edges) + 1,
+                         lookahead_length=self.lookahead_length, embedding_dim=self.embedding_dim,
+                         padding_dim=self.padding_dim, rollouts=15, max_depth=100)
 
         self.to(self.device)
 
@@ -430,15 +327,16 @@ class AlphaRouterAgent(nn.Module):
         rewards = []
 
         swaps = 0
-        state_embedding = self.embed_nodes(self.env._state)
 
         for _ in range(self.episode_limit):
+            old_state = deepcopy(self.env._state)
+
+            state_embedding = embed_nodes(self.env._state, self.lookahead_length, self.device,
+                                          self.qubit_embedding, self.embedding_dim, self.padding_dim)
             action, log_prob = self.get_action(state_embedding.unsqueeze(0))
             observation, reward, done, truncated, info = self.env.step(action)
 
-            new_embedding = self.embed_nodes(self.env._state)
-            self.replay_buffer.store(state_embedding, action, reward, new_embedding, done)
-            state_embedding = new_embedding
+            self.replay_buffer.store(old_state, action, reward, self.env._state, done)
 
             log_probs.append(log_prob)
             rewards.append(reward)
@@ -458,6 +356,21 @@ class AlphaRouterAgent(nn.Module):
         self.scaler.scale(policy_loss).backward()
         self.scaler.step(self.optimizer)
         self.scaler.update()
+
+        # MCTS
+        self.optimizer.zero_grad()
+        # if not len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
+        #     continue
+        mcts_input = self.replay_buffer.sample(1)
+        # mcts_input = self.env._state
+        # self.mcts.run(Node(mcts_input[0]))
+        mcts_reward = self.mcts.run(mcts_input[0])
+        # if mcts_reward is not None:
+
+            # MCTS backprop / gradient step
+            # self.scaler.scale(mcts_reward).backward()
+            # self.scaler.step(self.optimizer)
+            # self.scaler.update()
 
         return policy_loss, swaps, sum(rewards)
 
@@ -480,7 +393,8 @@ class AlphaRouterAgent(nn.Module):
         self.optimizer.zero_grad()
 
         state_embeddings = torch.stack(
-            [self.embed_nodes(env._state) for env in self.vec_env.envs],
+            [embed_nodes(env._state, self.lookahead_length, self.device, self.qubit_embedding,
+                              self.embedding_dim, self.padding_dim) for env in self.vec_env.envs],
             dim=0
         ).to(self.device)
 
@@ -507,7 +421,8 @@ class AlphaRouterAgent(nn.Module):
                 reward_list[i].append(rewards[i])
 
             new_embeddings = torch.stack(
-                [self.embed_nodes(env._state) for env in self.vec_env.envs],
+                [embed_nodes(env._state, self.lookahead_length, self.device, self.qubit_embedding,
+                                  self.embedding_dim, self.padding_dim) for env in self.vec_env.envs],
                 dim=0
             ).to(self.device)
 
@@ -540,59 +455,7 @@ class AlphaRouterAgent(nn.Module):
 
         return policy_loss, swaps, undiscounted_returns
 
-    def embed_nodes(self, state: RoutingState):
-        """
-        Return the node embedding based on the current environment.
 
-        We observe a maximum of self.lookahead_length gates and for each gate we produce a gate embedding in the following way:
-        - We retrieve logical qubits involved in the gate
-        - We retrieve physical qubits mapped to the logical qubits
-        - For each physical qubit we produce a qubit embedding with nn.Embedding
-        - We take a mean of these two qubit embeddings
-        - We concatenate this embedding with the depth of the gate, where depth is equal to the number of another gates
-            this gate depends on + 1
-        - We pad the embedding so that the length of the embedding is divisible by the number of the attention heads
-
-        This procedure yields a node embedding matrix of shape (Lookahead Length x (Embedding Dimension + 1))
-
-        :return: Node embedding
-        """
-        interaction_circuit = state.interaction_circuit[:self.lookahead_length]  # Limit lookahead depth
-
-        # Pre-generate physical qubit embeddings
-        phys_qubits = torch.arange(state.n_qubits, dtype=torch.long, device=device)
-        embeddings = self.qubit_embedding(phys_qubits)
-
-        feature_matrix = []
-        qubit_gate_dependencies: List[Set[int]] = []
-        for _ in range(state.n_qubits):
-            qubit_gate_dependencies.append(set())
-
-        for idx, (logical_q1, logical_q2) in enumerate(interaction_circuit):
-            physical_q1 = state.mapping[logical_q1]
-            physical_q2 = state.mapping[logical_q2]
-
-            embedding_q1 = embeddings[physical_q1]
-            embedding_q2 = embeddings[physical_q2]
-
-            gate_dependencies = qubit_gate_dependencies[logical_q1].union(qubit_gate_dependencies[logical_q2])
-            depth = len(gate_dependencies) + 1
-
-            gate_vector = (embedding_q1 + embedding_q2) / 2  # Mean of qubit encodings
-            gate_vector = nn.functional.pad(gate_vector, (0, 1), value=depth)  # Append depth
-
-            # Pad the input with 0s so that the dimensionality is a multiple of the number of heads
-            gate_vector = nn.functional.pad(gate_vector, (0, self.padding_dim), value=0)  # Append padding dimension
-
-            qubit_gate_dependencies[logical_q1].add(idx)
-            qubit_gate_dependencies[logical_q2].add(idx)
-
-            feature_matrix.append(gate_vector)
-
-        if len(feature_matrix) == 0:
-            return torch.zeros((self.lookahead_length, self.embedding_dim + 1), device=self.device)
-
-        return torch.stack(feature_matrix)
 
     def learn(self, total_timesteps: int, ma_window: int = 50, batch: bool = True) -> None:
         """
@@ -661,7 +524,8 @@ if __name__ == '__main__':
     model = AlphaRouterAgent(env, device).to(device)
 
     start = time.time()
-    model.learn(1024)
+    model.learn(64, batch=False)
+    # model.learn(1024, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
