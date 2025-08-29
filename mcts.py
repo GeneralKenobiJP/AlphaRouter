@@ -109,7 +109,7 @@ class MCTS:
         parent.children[node] = action
         return node
 
-    def expand(self, leaf_node: Node) -> (Node, int, Tensor):
+    def expand(self, leaf_node: Node) -> (Node, int):
         # actions_covered = leaf_node.children.values()
         # actions_remaining = list(range(self.swap_options))
         # for action in actions_remaining:
@@ -130,7 +130,7 @@ class MCTS:
 
         node = self.add_child(leaf_node, action, state)
 
-        return node, action, 0
+        return node, action
 
     def get_action(self, node_embedding) -> (Tensor, Tensor):
         """
@@ -215,18 +215,16 @@ class MCTS:
             node.visits += 1
             node.value += reward.item()
 
-    def run(self, root_state: RoutingState) -> Tensor:
+    def run(self, root_state: RoutingState) -> int:
         self.set_root(root_state)
-
-        returns = []
 
         for idx in range(self.rollouts):
             leaf_node, is_terminal, path_states, path_actions = self.select(self.root)
             if is_terminal:
                 self.backpropagate(path_states, path_actions, leaf_node.value)
-                returns.append(torch.tensor(leaf_node.value, device=self.device))
+                # returns.append(torch.tensor(leaf_node.value, device=self.device))
 
-            node, action, log_prob = self.expand(leaf_node)
+            node, action = self.expand(leaf_node)
             path_states.append(node.state)
             path_actions.append(action)
 
@@ -234,6 +232,6 @@ class MCTS:
 
             self.backpropagate(path_states, path_actions, reward)
 
-            returns.append(reward)
+            # returns.append(reward)
 
-        return torch.stack(returns).sum()
+        return self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]

@@ -190,7 +190,7 @@ def test_mcts():
     assert len(mcts.root.children) == 0
     assert mcts.transposition_table[gen_hash(root)] == mcts.root
 
-    node, action, _ = mcts.expand(mcts.root)
+    node, action = mcts.expand(mcts.root)
     assert len(mcts.transposition_table) == 2
     assert mcts.root.state == root
     assert mcts.root.value == 0
@@ -222,8 +222,20 @@ def test_mcts():
     assert mcts.transposition_table[gen_hash(root)] == mcts.root
     assert mcts.transposition_table[gen_hash(node.state)] == node
 
-    mcts.run(deepcopy(node.state))
+    best_action = mcts.run(deepcopy(node.state))
     assert len(mcts.transposition_table) > 2
     assert mcts.root.state == node.state
     assert node.visits > 1
     assert len(node.children) > 0
+    assert 0 <= best_action < swap_options
+
+    max_val = -np.inf
+    for child in mcts.root.children:
+        if child.value > max_val:
+            max_val = child.value
+
+    for child in mcts.root.children:
+        if mcts.root.children[child] == best_action:
+            assert child.value == max_val
+        else:
+            assert child.value <= max_val
