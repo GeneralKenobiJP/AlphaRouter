@@ -1,6 +1,6 @@
 import math
 from copy import deepcopy
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import torch
@@ -12,7 +12,7 @@ from torch.types import Device
 
 from manhattan_rewarder import ManhattanRewarder
 from transformer import Transformer
-from utils import embed_nodes
+from utils import embed_nodes, compute_returns, compute_returns_batched
 
 
 def gen_hash(state: RoutingState):
@@ -42,6 +42,7 @@ class MCTS:
                  device: Device, swap_options: int, c: float = math.sqrt(2), rollouts: int = 200, max_depth: int = 100,
                  lookahead_length: int = 48, embedding_dim: int = 24, padding_dim: int = 3):
         self.root: Node | None = None
+        self.roots: List[Node] | None = None
         self.transposition_table = dict()
         self.c_constant = c
         self.swap_options = swap_options
@@ -65,6 +66,17 @@ class MCTS:
             self.put_transposition(hash, self.root)
         else:
             self.root = node
+
+    def set_roots(self, states: List[RoutingState]) -> None:
+        for state in states:
+            hash = gen_hash(state)
+            node = self.get_transposition(hash)
+            if node is None:
+                cur = Node(state)
+                self.roots.append(cur)
+                self.put_transposition(hash, cur)
+            else:
+                self.roots.append(node)
 
     def ucb(self, root: Node, node: Node) -> float:
         return (node.value / (node.visits + 1e-6) +
@@ -151,33 +163,6 @@ class MCTS:
 
         return action, log_prob
 
-    def compute_returns(self, rewards, gamma=0.99):
-        """
-        Given a list of rewards [r0, r1, r2, …, r_{T-1}],
-        returns a list of discounted returns:
-          G_t = r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + …
-
-        Parameters
-        ----------
-        rewards: list of rewards collected in a given episode
-        gamma: float, discount factor.
-            The higher the gamma, the more important later rewards are.
-
-        Returns
-        -------
-        Discounted returns.
-        """
-        R = 0
-        returns = []
-        for r in reversed(rewards):
-            R = r + gamma * R
-            returns.insert(0, R)
-        returns = torch.tensor(returns)
-        # (Optionally) normalize returns to reduce variance:
-        # improves performance
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-        return returns
-
     def simulate(self, node: Node) -> Tensor:
         state = deepcopy(node.state)
 
@@ -199,13 +184,51 @@ class MCTS:
             log_probs.append(log_prob)
             rewards.append(reward)
 
-        returns = self.compute_returns(rewards)
+        returns = compute_returns(rewards)
         policy_loss = []
         for log_prob, G_t in zip(log_probs, returns):
             policy_loss.append(-log_prob * G_t)
         policy_loss = torch.stack(policy_loss).sum()
 
         return policy_loss
+
+    def simulate_batch(self, nodes: List[Node]) -> Tensor:
+        sim_states = [deepcopy(node.state) for node in nodes]
+
+        log_probs = []
+        rewards: List[List[float]] = [[] for _ in range(len(sim_states))]
+
+        with torch.no_grad():
+
+            for step in range(self.max_depth):
+                state_embeddings = [embed_nodes(node.state, self.lookahead_length, self.device, self.qubit_embedding,
+                                        self.embedding_dim, self.padding_dim) for node in nodes]
+                actions, log_prob = self.get_action(state_embeddings)
+
+                old_states = [deepcopy(state) for state in sim_states]
+
+                for i, state, old_state in enumerate(zip(sim_states, old_states)):
+                    state.update_state(actions[i])
+                    reward = self.rewarder.compute_reward(old_state=old_state, action=actions[i], new_state=state)
+
+                log_probs[i].append(log_prob)
+                rewards[i].append(reward)
+
+            returns, mask = compute_returns_batched(rewards, device=self.device)
+
+            # Convert log_prob_list to tensor for fast on-device computation
+            for i in range(len(sim_states)):
+                log_probs[i] = torch.stack(log_probs[i])
+            log_prob_tensor = torch.nn.utils.rnn.pad_sequence(log_probs, batch_first=True, padding_value=0.0).to(
+                self.device)  # (B, T)
+
+            # Policy gradient loss:
+            #  per-episode sum_t (log_prob * G_t), then mean across batch
+            # note: multiply by mask to ignore padding
+            per_episode_loss = - (log_prob_tensor * returns * mask).sum(dim=1)  # (B,)
+            policy_loss = per_episode_loss.mean()
+
+            return policy_loss
 
     def backpropagate(self, path_states: list[RoutingState], path_actions: list[int], reward: Tensor):
         path_states.reverse()
@@ -235,3 +258,27 @@ class MCTS:
             # returns.append(reward)
 
         return self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]
+
+    # def run_batch(self, batch: List[RoutingState]) -> int:
+    #     self.set_roots(batch)
+    #
+    #     ### todo: COMPLETE THIS
+    #     # todo: MULTITHREADING POOL (do 4 func variations prolly)
+    #
+    #     for idx in range(self.rollouts):
+    #         leaf_node, is_terminal, path_states, path_actions = self.select(self.root)
+    #         if is_terminal:
+    #             self.backpropagate(path_states, path_actions, leaf_node.value)
+    #             # returns.append(torch.tensor(leaf_node.value, device=self.device))
+    #
+    #         node, action = self.expand(leaf_node)
+    #         path_states.append(node.state)
+    #         path_actions.append(action)
+    #
+    #         reward = self.simulate(node)
+    #
+    #         self.backpropagate(path_states, path_actions, reward)
+    #
+    #         # returns.append(reward)
+    #
+    #     return self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]
