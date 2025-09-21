@@ -21,7 +21,7 @@ from torch.types import Device
 from torchviz import make_dot
 
 from custom_interaction_generator import CustomInteractionGenerator
-from mcts import MCTS, Node
+from mcts import ParallelMCTS
 from plotting import moving_average, plot
 from manhattan_rewarder import ManhattanRewarder
 
@@ -36,8 +36,10 @@ NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
 FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
+MCTS_PROCESSES: int = 16
 
-REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
+# REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
+REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 def render_rgb(env):
     """Convenience method that we will use later on to display our results. Copied from notebooks"""
@@ -165,10 +167,16 @@ class AlphaRouterAgent(nn.Module):
             buffer_size,
             self.device
         )
-        self.mcts = MCTS(make_env(connection_graph, ManhattanRewarder())(), self.transformer,
-                         self.qubit_embedding, self.device, swap_options=len(connection_graph.edges) + 1,
-                         lookahead_length=self.lookahead_length, embedding_dim=self.embedding_dim,
-                         padding_dim=self.padding_dim, rollouts=15, max_depth=100)
+        print("Init")
+        self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device,
+                                 swap_options=len(connection_graph.edges) + 1, lookahead_length=self.lookahead_length,
+                                 embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=15,
+                                 max_depth=100, processes=MCTS_PROCESSES)
+        print("Init successful")
+        # self.mcts = MCTS(make_env(connection_graph, ManhattanRewarder())(), self.transformer,
+        #                  self.qubit_embedding, self.device, swap_options=len(connection_graph.edges) + 1,
+        #                  lookahead_length=self.lookahead_length, embedding_dim=self.embedding_dim,
+        #                  padding_dim=self.padding_dim, rollouts=15, max_depth=100)
 
         self.to(self.device)
 
@@ -254,10 +262,10 @@ class AlphaRouterAgent(nn.Module):
         self.optimizer.zero_grad()
         # if not len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
         #     continue
-        mcts_input = self.replay_buffer.sample(1)
+        # mcts_input = self.replay_buffer.sample(1)
         # mcts_input = self.env._state
         # self.mcts.run(Node(mcts_input[0]))
-        mcts_reward = self.mcts.run(mcts_input[0])
+        # mcts_reward = self.mcts.run_parallel(mcts_input[0])
         # if mcts_reward is not None:
 
             # MCTS backprop / gradient step
@@ -345,6 +353,14 @@ class AlphaRouterAgent(nn.Module):
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
+
+        print(len(self.replay_buffer))
+
+        if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
+            mcts_input = self.replay_buffer.sample(MCTS_PROCESSES)
+            mcts_action = self.mcts.run_parallel(mcts_input[0])
+            print(mcts_action)
+
         # Return undiscounted returns per env for plotting and analysis
         undiscounted_returns = torch.tensor([sum(r) for r in reward_list], dtype=torch.float32, device=returns.device)
 
@@ -390,6 +406,7 @@ class AlphaRouterAgent(nn.Module):
 
 
 if __name__ == '__main__':
+    print("Hello world")
     connection_graph = nx.Graph()
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
     connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
@@ -413,13 +430,13 @@ if __name__ == '__main__':
     print(f"cuda availability: {torch.cuda.is_available()}")
     print(f"device count: {torch.cuda.device_count()}")  # number of GPUs
     print(f"devices: {torch.cuda.get_device_name}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     print(f"device: {device}")
     model = AlphaRouterAgent(env, device).to(device)
 
     start = time.time()
-    model.learn(64, batch=True)
+    model.learn(256, batch=True)
     # model.learn(1024, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
