@@ -1,24 +1,22 @@
 import math
-import multiprocessing
+import os
 from copy import deepcopy
-import multiprocessing as mp
-from multiprocessing import Pool, Process
+import torch.multiprocessing as mp
+from torch.multiprocessing import Process
 from queue import Queue
-from threading import Lock
 from typing import Optional, List, Dict, Tuple
 
-import numpy as np
 import torch
-from qgym.envs import Routing
 from qgym.envs.routing import RoutingState
-from torch import Tensor, nn
+from torch import Tensor, nn, detach
 from torch.amp import GradScaler, autocast
 from torch.nn import Embedding
 from torch.types import Device
+from tqdm import tqdm
 
 from manhattan_rewarder import ManhattanRewarder
 from transformer import Transformer
-from utils import embed_nodes, compute_returns, compute_returns_batched
+from utils import embed_nodes, compute_returns
 
 
 def gen_hash(state: RoutingState):
@@ -215,34 +213,13 @@ class MCTS:
         return self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]
 
 
-# class InferenceQueue:
-#     def __init__(self):
-#         self.lock: Lock = Lock()
-#         self.inference_queue: Queue = Queue()
-#
-#     def put(self, embedding: Tensor, output_future: Future):
-#         with self.lock:
-#             self.inference_queue.put((embedding, output_future))
-#
-#     def poll(self) -> (Tensor, Future):
-#         while True:
-#             try:
-#                 with self.lock:
-#                     return self.inference_queue.get(timeout=200)
-#             except:
-#                 pass
-#
-#     def __len__(self):
-#         with self.lock:
-#             return len(self.inference_queue.queue)
-
-
 class MCTSWorker:
-    def __init__(self, idx: int, inference_queue: mp.Queue, output_queue: mp.Queue,
-                 qubit_embedding: nn.Embedding, device: Device, c: float = math.sqrt(2), rollouts: int = 200,
+    def __init__(self, idx: int, qubit_embedding: nn.Embedding,
+                 device: Device, swap_options: int, c: float = math.sqrt(2), rollouts: int = 200,
                  max_depth: int = 100, lookahead_length: int = 48, embedding_dim: int = 24, padding_dim: int = 3):
         self.root: Node | None = None
         self.transposition_table = dict()
+        self.swap_options = swap_options
         self.c_constant = c
         self.qubit_embedding = qubit_embedding
         self.rollouts = rollouts
@@ -252,8 +229,8 @@ class MCTSWorker:
         self.embedding_dim = embedding_dim
         self.padding_dim = padding_dim
         self.rewarder = ManhattanRewarder()
-        self.inference_queue = inference_queue
-        self.output_queue = output_queue
+        self.inference_queue: mp.Queue | None = None
+        self.output_queue: mp.Queue | None = None
         self.idx = idx
 
     def set_root(self, state: RoutingState) -> None:
@@ -264,6 +241,10 @@ class MCTSWorker:
             self.put_transposition(hash, self.root)
         else:
             self.root = node
+
+    def set_queues(self, inference_queue: Queue, output_queue: Queue) -> None:
+        self.inference_queue = inference_queue
+        self.output_queue = output_queue
 
     # def add_node_if_absent(self, state: RoutingState) -> Node:
     #     hash = gen_hash(state)
@@ -339,14 +320,15 @@ class MCTSWorker:
             if state.is_done():
                 break
 
-            embedding = embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
-                                    self.embedding_dim, self.padding_dim)
+            embedding = detach(embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
+                                    self.embedding_dim, self.padding_dim).cpu()).share_memory_()
 
-            # future_output = Future(self.device)
             self.inference_queue.put((self.idx, embedding))
 
-            # action, log_prob = future_output.wait()
-            action, log_prob = self.output_queue.get()
+            try:
+                action, log_prob = self.output_queue.get()
+            except:
+                break
 
             old_state = deepcopy(state)
             state.update_state(action)
@@ -386,31 +368,104 @@ class MCTSWorker:
 
         self.backpropagate(path_states, path_actions, reward)
 
-    def run(self, root_state: RoutingState, clear_tree: bool = True) -> int:
-        # root = self.add_node_if_absent(root_state)
+    def run(self, root_state: RoutingState, clear_tree: bool = True) -> (int, float):
         if clear_tree:
             self.transposition_table = dict()
 
         self.set_root(root_state)
 
-        for _ in range(self.rollouts):
-            self.rollout(self.root)
+        with torch.no_grad():
+            for i in range(self.rollouts):
+                print(f'worker{self.idx}: rollout {i}')
+                self.rollout(self.root)
 
-        return self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]
+        self.inference_queue.put((self.idx, None))
+
+        best_action = self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]
+        state_eval = self.root.value
+        return best_action, state_eval
 
     # def update_tree(self, master_tree: Dict):
     #     self.transposition_table = master_tree.copy()
+
+
+def run_worker(worker: MCTSWorker, root_state: RoutingState, inference_queue: mp.Queue, output_queue: mp.Queue) -> (int, int):
+    print(f"Running worker {worker.idx} with pid {os.getpid()}...")
+    worker.set_queues(inference_queue, output_queue)
+    try:
+        return worker.run(root_state)
+    except Exception as e:
+        print(f"Worker {worker.idx} with pid {os.getpid()} died. Exception {e} caught.")
+        return None
+
+
+def get_action(node_embedding, transformer: Transformer, device: Device) -> (Tensor, Tensor):
+    """
+    Based on the current environment state, get an action suggested by the agent
+    :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
+    :return:
+        Action - tensor of the index of the swap option (last option is no swap)
+        log_prob - tensor of log probability of the action being optimal as predicted by the model
+    """
+    with autocast(device.type):
+        transformer_output = transformer(node_embedding)
+        swap_scores = transformer_output.sum(dim=1)
+        softmax_output = torch.softmax(swap_scores, dim=-1)
+        dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
+
+        action = dist.sample()
+        log_prob: Tensor = dist.log_prob(action)
+
+    return action, log_prob
+
+
+def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: List[mp.Queue], transformer: Transformer,
+                   device: Device):
+    awaiting_states: List[Tuple[int, Embedding]] = []
+    output_queues_states: List[bool] = [True] * len(output_queues)
+    running_processes_num = processes
+
+    # misses = 0
+    while True:
+        while len(awaiting_states) < running_processes_num:
+            try:
+                awaiting_states.append(inference_queue.get(timeout=0.5))
+                # print(f'len(awaiting_states): {len(awaiting_states)}')
+                if awaiting_states[-1] is None:
+                    return
+                if awaiting_states[-1][-1] is None:
+                    idx = awaiting_states[-1][0]
+                    output_queues_states[idx] = False
+                    running_processes_num -= 1
+                    # output_queues[idx].close()
+                    awaiting_states.pop()
+                    if running_processes_num == 0:
+                        return
+            except:
+                if len(awaiting_states) > 0:
+                    break
+
+        embeddings = [t for _, t in awaiting_states]
+        embedding = torch.stack(embeddings, dim=0)
+        actions, log_probs = get_action(embedding, transformer, device)
+
+        for idx, (idx_sender, _) in enumerate(awaiting_states):
+            if output_queues_states[idx_sender] is False:
+                continue
+            output_queues[idx_sender].put((detach(actions[idx].cpu()), detach(log_probs[idx].cpu())))
+
+        awaiting_states.clear()
 
 
 class ParallelMCTS:
     def __init__(self, transformer: Transformer, qubit_embedding: nn.Embedding,
                  device: Device, swap_options: int, c: float = math.sqrt(2), rollouts: int = 200, max_depth: int = 100,
                  lookahead_length: int = 48, embedding_dim: int = 24, padding_dim: int = 3, processes: int = 0):
-        # self.roots: List[Node] | None = None
-        # self.transposition_table = dict()
+        mp.set_start_method("spawn", force=True)
         self.c_constant = c
         self.swap_options = swap_options
         self.transformer = transformer
+        self.transformer.share_memory()
         self.qubit_embedding = qubit_embedding
         self.rollouts = rollouts
         self.max_depth = max_depth
@@ -421,109 +476,45 @@ class ParallelMCTS:
         self.padding_dim = padding_dim
         self.rewarder = ManhattanRewarder()
         self.processes = processes
-        self.inference_queue = mp.Queue()
-        # self._worker_manager = mp.Manager()
-        # self.output_queue = self._worker_manager.Queue()
-        self.output_queues = [mp.Queue() for _ in range(self.processes)]
-        # self.inference_queue = InferenceQueue()
+        self.manager = mp.Manager()
+        # self.inference_queue = mp.Queue()
+        # self.output_queues = [mp.Queue() for _ in range(self.processes)]
+        self.inference_queue = self.manager.Queue()
+        self.output_queues = [self.manager.Queue() for _ in range(self.processes)]
         self.workers: List[MCTSWorker] = [
-            MCTSWorker(i, self.inference_queue, self.output_queues[i], self.qubit_embedding, self.device, self.c_constant,
+            MCTSWorker(i, self.qubit_embedding, self.device, self.swap_options, self.c_constant,
                        self.rollouts, self.max_depth, self.lookahead_length, self.embedding_dim, self.padding_dim)
 
             for i in range(processes)
         ]
-        self.pool = Pool(processes=processes)
+        self.pool = mp.Pool(processes=processes)
 
-    # def set_roots(self, states: List[RoutingState]) -> None:
-    #     for (i, state) in enumerate(states):
-    #         hash = gen_hash(state)
-    #         node = self.get_transposition(hash)
-    #         if node is None:
-    #             cur = Node(state)
-    #             self.roots.append(cur)
-    #             self.put_transposition(hash, cur)
-    #         else:
-    #             self.roots.append(node)
+    def run_parallel(self, root_states: List[RoutingState]) -> (List[int], List[float]):
+        self.transformer.eval()
 
-    def get_action(self, node_embedding) -> (Tensor, Tensor):
-        """
-        Based on the current environment state, get an action suggested by the agent
-        :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
-        :return:
-            Action - tensor of the index of the swap option (last option is no swap)
-            log_prob - tensor of log probability of the action being optimal as predicted by the model
-        """
-        with autocast(self.device.type):
-            transformer_output = self.transformer(node_embedding)
-            swap_scores = transformer_output.sum(dim=1)
-            softmax_output = torch.softmax(swap_scores, dim=-1)
-            dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
-
-            action = dist.sample()
-            log_prob: Tensor = dist.log_prob(action)
-
-        return action, log_prob
-
-    def inference_loop(self):
-        awaiting_states: List[Tuple[int, Embedding]] = []
-
-        while True:
-            while len(awaiting_states) < self.processes:
-                awaiting_states.append(self.inference_queue.get(timeout=100))
-
-            embeddings = [t for _, t in awaiting_states]
-            embedding = torch.stack(embeddings, dim=0)
-            actions, log_prob = self.get_action(embedding)
-
-            for idx_sender, _ in awaiting_states:
-                self.output_queues[idx_sender].put((actions, log_prob))
-
-            # for i in range(len(awaiting_states)):
-                # awaiting_states[i][1].set_result((actions[i], log_prob[i]))
-
-            awaiting_states.clear()
-
-    def run_worker(self, idx: int, root_state: RoutingState):
-        print(f"Running worker {idx}...")
-        return self.workers[idx].run(root_state)
-
-    def run_parallel(self, root_states: List[RoutingState]) -> List[int]:
-        queue_loop = Process(target=self.inference_loop)
+        queue_loop = Process(target=inference_loop,
+                             args=(self.processes, self.inference_queue, self.output_queues, self.transformer, self.device))
         queue_loop.start()
 
-        args = zip(range(self.processes), root_states)
-        evaluated_roots = self.pool.map(self.run_worker, args)
+        args = list(zip(self.workers, root_states, [self.inference_queue] * self.processes, self.output_queues))
 
-        # asyncs = [self.pool.apply_async(self.rollout) for _ in range(self.rollouts)]
-        # .get() blocks until the task finishes and will re-raise worker exceptions
-        # for a in asyncs:
-        #     a.get()
+        evaluated_roots = self.pool.starmap(run_worker, args)
+        # procs = []
+        # results = []
+        # for arg_list in args:
+        #     p = mp.Process(target=run_worker, args=arg_list)
+        #     p.start()
+        #     procs.append(p)
+        # for p in procs:
+        #     p.join()
 
-        queue_loop.terminate()
+        # Terminate the inference queue loop
+        if queue_loop.is_alive():
+            self.inference_queue.put(None)
+            queue_loop.join()
 
-        return [root.children[max(root.children.keys(), key=lambda child: child.value)] for root in evaluated_roots]
-        # return self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]
-
-    # def run_batch(self, batch: List[RoutingState]) -> int:
-    #     self.set_roots(batch)
-    #
-    #     ### todo: COMPLETE THIS
-    #     # todo: MULTITHREADING POOL (do 4 func variations prolly)
-    #
-    #     for idx in range(self.rollouts):
-    #         leaf_node, is_terminal, path_states, path_actions = self.select(self.root)
-    #         if is_terminal:
-    #             self.backpropagate(path_states, path_actions, leaf_node.value)
-    #             # returns.append(torch.tensor(leaf_node.value, device=self.device))
-    #
-    #         node, action = self.expand(leaf_node)
-    #         path_states.append(node.state)
-    #         path_actions.append(action)
-    #
-    #         reward = self.simulate(node)
-    #
-    #         self.backpropagate(path_states, path_actions, reward)
-    #
-    #         # returns.append(reward)
-    #
-    #     return self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]
+        actions = [a for a, _ in evaluated_roots]
+        state_values = [v for _, v in evaluated_roots]
+        return actions, state_values
+        # return [root.children[max(root.children.keys(), key=lambda child: child.value)] for root in evaluated_roots]
+        # raise Exception

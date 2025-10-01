@@ -36,7 +36,7 @@ NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
 FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 16
+MCTS_PROCESSES: int = 5
 
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
@@ -110,11 +110,11 @@ class ReplayBuffer:
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        states = deepcopy(states[0])
-        actions = actions[0].to(self.device)
-        rewards = rewards[0]
-        next_states = deepcopy(next_states[0])
-        dones = dones[0]
+        states = deepcopy(states)
+        # actions = actions.to(self.device)
+        # rewards = rewards
+        next_states = deepcopy(next_states)
+        # dones = dones
 
         return states, actions, rewards, next_states, dones
 
@@ -358,8 +358,9 @@ class AlphaRouterAgent(nn.Module):
 
         if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
             mcts_input = self.replay_buffer.sample(MCTS_PROCESSES)
+            print(f'mcts_input: {mcts_input}')
             mcts_action = self.mcts.run_parallel(mcts_input[0])
-            print(mcts_action)
+            print(f'mcts_action: {mcts_action}')
 
         # Return undiscounted returns per env for plotting and analysis
         undiscounted_returns = torch.tensor([sum(r) for r in reward_list], dtype=torch.float32, device=returns.device)
