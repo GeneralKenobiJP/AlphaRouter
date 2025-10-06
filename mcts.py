@@ -396,7 +396,7 @@ def run_worker(worker: MCTSWorker, root_state: RoutingState, inference_queue: mp
         return worker.run(root_state)
     except Exception as e:
         print(f"Worker {worker.idx} with pid {os.getpid()} died. Exception {e} caught.")
-        return None
+        return None, None
 
 
 def get_action(node_embedding, transformer: Transformer, device: Device) -> (Tensor, Tensor):
@@ -513,7 +513,7 @@ class ParallelMCTS:
             self.inference_queue.put(None)
             queue_loop.join()
 
-        actions = [a for a, _ in evaluated_roots]
+        actions = [a.item() for a, _ in evaluated_roots]
         state_values = [v for _, v in evaluated_roots]
         return actions, state_values
         # return [root.children[max(root.children.keys(), key=lambda child: child.value)] for root in evaluated_roots]
