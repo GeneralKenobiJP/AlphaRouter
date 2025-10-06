@@ -36,7 +36,7 @@ NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
 FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 13
+MCTS_PROCESSES: int = 10
 
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
@@ -206,7 +206,6 @@ class AlphaRouterAgent(nn.Module):
 
             action = dist.sample()
             log_prob: Tensor = dist.log_prob(action)
-            print('log_prob size: {}', log_prob.size())
 
         return action, log_prob, swap_scores
 
@@ -235,7 +234,8 @@ class AlphaRouterAgent(nn.Module):
 
             state_embedding = embed_nodes(self.env._state, self.lookahead_length, self.device,
                                           self.qubit_embedding, self.embedding_dim, self.padding_dim)
-            action, log_prob, _ = self.get_action(state_embedding.unsqueeze(0))
+            # action, log_prob, _ = self.get_action(state_embedding.unsqueeze(0))
+            action, log_prob, _, _ = self.transformer(state_embedding.unsqueeze(0))
             observation, reward, done, truncated, info = self.env.step(action)
 
             self.replay_buffer.store(old_state, action, reward, self.env._state, done)
@@ -308,7 +308,8 @@ class AlphaRouterAgent(nn.Module):
         for step_idx in range(self.episode_limit):
             old_states = [deepcopy(cur_env._state) for cur_env in self.vec_env.envs]
 
-            actions, log_probs, _ = self.get_action(state_embeddings)
+            # actions, log_probs, _ = self.get_action(state_embeddings)
+            actions, log_probs, _, _ = self.transformer(state_embeddings)
 
             observations, rewards, terminated, truncated, info = self.vec_env.step(actions)
             done = np.logical_or(terminated, truncated)
@@ -369,8 +370,9 @@ class AlphaRouterAgent(nn.Module):
                 dim=0
             ).to(self.device)
 
-            transformer_actions, transformer_log_probs, transformer_state_evals = self.get_action(embeddings)
-            print(f'transformer_log_probs: {transformer_log_probs}')
+            # transformer_actions, transformer_log_probs, transformer_state_evals = self.get_action(embeddings)
+            transformer_actions, _, transformer_state_evals, transformer_all_log_probs = self.transformer(embeddings)
+            print(f'transformer_log_probs: {transformer_all_log_probs}')
             # l1 = transformer_log_probs[mcts_actions].sum(dim=1)
             print(f'### l1: {l1}')
 

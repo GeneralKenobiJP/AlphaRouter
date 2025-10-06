@@ -447,7 +447,8 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
 
         embeddings = [t for _, t in awaiting_states]
         embedding = torch.stack(embeddings, dim=0)
-        actions, log_probs = get_action(embedding, transformer, device)
+        # actions, log_probs = get_action(embedding, transformer, device)
+        actions, log_probs, _, _ = transformer(embedding)
 
         for idx, (idx_sender, _) in enumerate(awaiting_states):
             if output_queues_states[idx_sender] is False:
