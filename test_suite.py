@@ -10,7 +10,7 @@ from torch import nn, Tensor, tensor
 from custom_interaction_generator import CustomInteractionGenerator
 from main import ReplayBuffer, ManhattanRewarder, AlphaRouterAgent, \
     LOOKAHEAD_LENGTH
-from mcts import MCTS, gen_hash
+from mcts import MCTS, gen_hash, MCTSWorker, inference_loop
 from transformer import PositionalEncoding, TransformerLayer, Transformer
 
 
@@ -25,6 +25,7 @@ def test_positional_encoding_shape():
     out = pe(x)
     assert out.shape == x.shape, "PositionalEncoding should preserve input shape"
 
+
 def test_positional_encoding_variation():
     embedding_dim = 8
     lookahead_length = 6
@@ -33,6 +34,7 @@ def test_positional_encoding_variation():
     out = pe(x)
     # Ensure the positional encoding actually adds non-zero components
     assert not torch.allclose(out, x), "Output should differ from input for non-zero PE"
+
 
 # --- TransformerLayer tests ---
 
@@ -46,6 +48,7 @@ def test_transformer_layer_forward():
     x = torch.randn(B, T, d_model)
     out = layer(x)
     assert out.shape == (B, T, d_model), "TransformerLayer forward should preserve (B, T, D)"
+
 
 # --- Transformer tests ---
 
@@ -62,6 +65,7 @@ def test_transformer_forward_shape():
     out = trans(x)
     # Output should be (lookahead, swap_options)
     assert out.shape == (lookahead, swap_options), "Transformer should output (T, swap_options)"
+
 
 # --- ReplayBuffer tests ---
 
@@ -87,6 +91,7 @@ def test_replay_buffer_store_and_sample():
     assert next_states.shape == (batch_size, *state_shape)
     assert dones.shape == (batch_size,)
 
+
 # --- ManhattanRewarder tests ---
 
 class DummyState:
@@ -95,17 +100,20 @@ class DummyState:
         self.interaction_circuit = circuit
         self.n_qubits = len(mapping) - 1
 
+
 def test_manhattan_rewarder_empty():
     rew = ManhattanRewarder()
-    old = DummyState([0,1], [])
-    new = DummyState([0,1], [])
+    old = DummyState([0, 1], [])
+    new = DummyState([0, 1], [])
     assert rew.compute_reward(old_state=old, action=0, new_state=new) == 0
+
 
 def test_manhattan_rewarder_nonempty():
     rew = ManhattanRewarder()
-    old = DummyState([0,1,2], [(0,2)])
-    new = DummyState([0,2,1], [(0,2)])
+    old = DummyState([0, 1, 2], [(0, 2)])
+    new = DummyState([0, 2, 1], [(0, 2)])
     assert rew.compute_reward(old_state=old, action=0, new_state=new) == -1
+
 
 def test_manhattan_rewarder_long():
     rew = ManhattanRewarder()
@@ -113,20 +121,24 @@ def test_manhattan_rewarder_long():
     new = DummyState([0, 1, 2, 3, 4, 6, 5], [(0, 6)])
     assert rew.compute_reward(old_state=old, action=0, new_state=new) == -5
 
+
 # --- embed_nodes tests ---
 
 class DummyEnv:
     pass
+
 
 def test_embed_nodes_basic():
     agent = AlphaRouterAgent.__new__(AlphaRouterAgent)
     # Monkey-patch minimal attributes
     agent.lookahead_length = 3
     agent.embedding_dim = 5
+
     class S:
         n_qubits = 2
         mapping = [1, 0]
-        interaction_circuit = [(0,1), (1,0)]
+        interaction_circuit = [(0, 1), (1, 0)]
+
     env = DummyEnv()
     env._state = S()
     agent.env = env
@@ -134,6 +146,7 @@ def test_embed_nodes_basic():
     mat = agent.embed_nodes()
     # Should produce a tensor of shape (2, embedding_dim+1)
     assert mat.shape == (2, agent.embedding_dim + 1)
+
 
 # --- get_action tests ---
 
@@ -173,10 +186,11 @@ def test_mcts():
     transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead, swap_options)
     device = torch.device("cpu")
     qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(),
-                                            embedding_dim=embedding_dim-1).to(device)
+                                   embedding_dim=embedding_dim - 1).to(device)
 
     mcts = MCTS(env=env, transformer=transformer, qubit_embedding=qubit_embedding, device=device,
-                swap_options=swap_options, max_depth=5, lookahead_length=lookahead, embedding_dim=embedding_dim,padding_dim=0)
+                swap_options=swap_options, max_depth=5, lookahead_length=lookahead, embedding_dim=embedding_dim,
+                padding_dim=0)
 
     root = deepcopy(env._state)
 
@@ -239,3 +253,126 @@ def test_mcts():
             assert child.value == max_val
         else:
             assert child.value <= max_val
+
+    # --- ParallelMCTS implementation tests
+
+
+# def test_mcts_worker():
+#     connection_graph = nx.Graph()
+#     connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)])
+#
+#     print("AZBEST")
+#
+#     env = Routing(
+#         max_observation_reach=LOOKAHEAD_LENGTH,
+#         observe_legal_surpasses=True,
+#         observe_connection_graph=True,
+#         connection_graph=connection_graph,
+#         render_mode="rgb_array",
+#         rewarder=None,
+#         interaction_generator=CustomInteractionGenerator()
+#     )
+#
+#     embedding_dim = 8
+#     num_heads = 2
+#     ffn_dim = 16
+#     num_layers = 1
+#     lookahead = 5
+#     swap_options = 7
+#     transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead, swap_options)
+#     device = torch.device("cpu")
+#     qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(),
+#                                    embedding_dim=embedding_dim - 1).to(device)
+#
+#     worker = MCTSWorker(idx=0, qubit_embedding=qubit_embedding, device=device,
+#                         swap_options=swap_options, rollouts=50, max_depth=50, lookahead_length=lookahead,
+#                         embedding_dim=embedding_dim,
+#                         padding_dim=0)
+#
+#     root = deepcopy(env._state)
+#
+#     assert len(worker.transposition_table) == 0
+#
+#     worker.set_root(root)
+#     assert len(worker.transposition_table) == 1
+#     assert worker.root.state == root
+#     assert worker.root.value == 0
+#     assert worker.root.visits == 0
+#     assert len(worker.root.children) == 0
+#     assert worker.transposition_table[gen_hash(root)] == worker.root
+#
+#     node, action = worker.expand(worker.root)
+#     assert len(worker.transposition_table) == 2
+#     assert worker.root.state == root
+#     assert worker.root.value == 0
+#     assert worker.root.visits == 0
+#     assert len(worker.root.children) == 1
+#     assert worker.root.children[node] == 0
+#     assert node.value == 0
+#     assert node.visits == 0
+#     assert len(node.children) == 0
+#     assert action == 0
+#
+#     manager = torch.multiprocessing.Manager()
+#     output_queue = manager.Queue()
+#     inference_queue = manager.Queue()
+#     worker.set_queues(inference_queue, output_queue)
+#
+#     queue_loop = torch.multiprocessing.Process(target=inference_loop,
+#                                                args=(1, inference_queue, [output_queue], transformer, device))
+#     queue_loop.start()
+#
+#     with torch.multiprocessing.Pool(processes=1) as pool:
+#         reward = pool.starmap(worker.simulate, [(node,)])[0]
+#         assert reward is not None
+#
+#     if queue_loop.is_alive():
+#         inference_queue.put(None)
+#         queue_loop.join()
+#
+#     path_states = [worker.root.state, node.state]
+#     path_actions = [0, 0]
+#     worker.backpropagate(path_states, path_actions, reward)
+#
+#     assert len(worker.transposition_table) == 2
+#     assert worker.root.state == root
+#     assert worker.root.value == reward.item()
+#     assert worker.root.visits == 1
+#     assert len(worker.root.children) == 1
+#     assert worker.root.children[node] == 0
+#     assert node.value == reward
+#     assert node.visits == 1
+#     assert len(node.children) == 0
+#
+#     assert worker.transposition_table[gen_hash(root)] == worker.root
+#     assert worker.transposition_table[gen_hash(node.state)] == node
+#
+#     queue_loop = torch.multiprocessing.Process(target=inference_loop,
+#                                                args=(1, inference_queue, [output_queue], transformer, device))
+#     queue_loop.start()
+#
+#     with torch.multiprocessing.Pool(processes=1) as pool:
+#         best_action, state_value = pool.starmap(worker.run, [(deepcopy(node.state), False)])[0]
+#
+#     if queue_loop.is_alive():
+#         inference_queue.put(None)
+#         queue_loop.join()
+#
+#     assert node.is_terminal()
+#     assert len(worker.transposition_table) > 2
+#     assert worker.root.state == node.state
+#     assert node.visits > 1
+#     assert len(node.children) > 0
+#     assert 0 <= best_action < swap_options
+#     assert state_value is not None
+#
+#     max_val = -np.inf
+#     for child in worker.root.children:
+#         if child.value > max_val:
+#             max_val = child.value
+#
+#     for child in worker.root.children:
+#         if worker.root.children[child] == best_action:
+#             assert child.value == max_val
+#         else:
+#             assert child.value <= max_val

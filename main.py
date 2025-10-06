@@ -21,14 +21,14 @@ from torch.types import Device
 from torchviz import make_dot
 
 from custom_interaction_generator import CustomInteractionGenerator
-from mcts import MCTS, Node
+from mcts import ParallelMCTS
 from plotting import moving_average, plot
 from manhattan_rewarder import ManhattanRewarder
 
 from gymnasium.vector import SyncVectorEnv
 
 from transformer import Transformer
-from utils import NormalizeInfoWrapper, embed_nodes
+from utils import NormalizeInfoWrapper, embed_nodes, compute_returns, compute_returns_batched
 
 EMBEDDING_DIM = 20      # AR paper embedding dimension
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length
@@ -36,8 +36,10 @@ NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
 FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
+MCTS_PROCESSES: int = 13
 
-REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
+# REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
+REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 def render_rgb(env):
     """Convenience method that we will use later on to display our results. Copied from notebooks"""
@@ -108,11 +110,11 @@ class ReplayBuffer:
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        states = deepcopy(states[0])
-        actions = actions[0].to(self.device)
-        rewards = rewards[0]
-        next_states = deepcopy(next_states[0])
-        dones = dones[0]
+        states = deepcopy(states)
+        # actions = actions.to(self.device)
+        # rewards = rewards
+        next_states = deepcopy(next_states)
+        # dones = dones
 
         return states, actions, rewards, next_states, dones
 
@@ -165,10 +167,16 @@ class AlphaRouterAgent(nn.Module):
             buffer_size,
             self.device
         )
-        self.mcts = MCTS(make_env(connection_graph, ManhattanRewarder())(), self.transformer,
-                         self.qubit_embedding, self.device, swap_options=len(connection_graph.edges) + 1,
-                         lookahead_length=self.lookahead_length, embedding_dim=self.embedding_dim,
-                         padding_dim=self.padding_dim, rollouts=15, max_depth=100)
+        print("Init")
+        self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device,
+                                 swap_options=len(connection_graph.edges) + 1, lookahead_length=self.lookahead_length,
+                                 embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=15,
+                                 max_depth=100, processes=MCTS_PROCESSES)
+        print("Init successful")
+        # self.mcts = MCTS(make_env(connection_graph, ManhattanRewarder())(), self.transformer,
+        #                  self.qubit_embedding, self.device, swap_options=len(connection_graph.edges) + 1,
+        #                  lookahead_length=self.lookahead_length, embedding_dim=self.embedding_dim,
+        #                  padding_dim=self.padding_dim, rollouts=15, max_depth=100)
 
         self.to(self.device)
 
@@ -178,114 +186,7 @@ class AlphaRouterAgent(nn.Module):
         env_fns = [make_env(connection_graph, ManhattanRewarder()) for _ in range(N_ENVS)]
         self.vec_env = SyncVectorEnv(env_fns)
 
-    def compute_returns(self, rewards, gamma=0.99):
-        """
-        Given a list of rewards [r0, r1, r2, …, r_{T-1}],
-        returns a list of discounted returns:
-          G_t = r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + …
-
-        Parameters
-        ----------
-        rewards: list of rewards collected in a given episode
-        gamma: float, discount factor.
-            The higher the gamma, the more important later rewards are.
-
-        Returns
-        -------
-        Discounted returns.
-        """
-        R = 0
-        returns = []
-        for r in reversed(rewards):
-            R = r + gamma * R
-            returns.insert(0, R)
-        returns = torch.tensor(returns)
-        # (Optionally) normalize returns to reduce variance:
-        # improves performance
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-        return returns
-
-    def _pad_and_mask_rewards(self, reward_list: list[list[float]]) -> (Tensor, Tensor):
-        """
-        Pads the list of rewards and masks it.
-        The reward list is of shape (N_ENVS, #steps),
-        where #steps varies per env.
-        We want to pad it with zeros so that the shape becomes
-        (N_ENVS, limit of steps).
-
-        Additionally, we want to produce a mask that will show
-        which indices are just paddings, for future reference.
-
-        Parameters
-        ----------
-        reward_list: list of rewards collected in a given episode
-            Shape: (N_ENVS, #steps), where #steps varies per env
-
-        Returns
-        -------
-        A tuple of two elements:
-            - Padded reward list of shape(N_ENVS, limit of steps),
-            - Padding mask with 1 for each entry being an actual reward and 0 for a padding
-        """
-        size = len(reward_list)
-        max_length = max(len(rewards) for rewards in reward_list) if size > 0 else 0
-
-        padded_reward_list = torch.zeros((size, max_length), dtype=torch.float32, device=self.device)
-        mask = torch.zeros((size, max_length), dtype=torch.float32, device=self.device)
-
-        for i, rewards in enumerate(reward_list):
-            length = len(rewards)
-            if length == 0:
-                continue
-            padded_reward_list[i, :length] = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-            mask[i, :length] = 1
-        return padded_reward_list, mask
-
-    def compute_returns_batched(self, reward_list: list[list[float]], gamma=0.99) -> (Tensor, Tensor):
-        """
-        Given a list of rewards [r0, r1, r2, …, r_{T-1}],
-        returns a list of discounted returns:
-          G_t = r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + …
-
-        Considers a full batch of rewards for multiple envs
-
-        Parameters
-        ----------
-        reward_list: list of rewards collected in a given episode
-            Shape: (N_ENVS, #steps), where #steps varies per env
-        gamma: float, discount factor.
-            The higher the gamma, the more important later rewards are.
-
-        Returns
-        -------
-        A tuple of two elements:
-            - Discounted returns.
-            - Padding mask with 1 for each entry being an actual reward and 0 for a padding.
-        """
-
-        padded_reward_list, mask = self._pad_and_mask_rewards(reward_list)
-
-        batch_size, length = padded_reward_list.shape
-        returns = torch.zeros((batch_size, length), dtype=padded_reward_list.dtype, device=self.device)
-
-        R = torch.zeros(batch_size, dtype=padded_reward_list.dtype, device=self.device)
-
-        for i in range(length-1, -1, -1):
-            R = padded_reward_list[:, i] + gamma * R
-            R = R * mask[:, i]
-            returns[:, i] = R
-
-        # (Optionally) normalize returns to reduce variance:
-        # improves performance
-        valid = mask.bool()
-        vals = returns[valid]
-        mean = vals.mean()
-        std = vals.std(unbiased=False)
-        returns = (returns - mean) / (std + 1e-8)
-
-        return returns, mask
-
-    def get_action(self, node_embedding) -> (Tensor, Tensor):
+    def get_action(self, node_embedding) -> (Tensor, Tensor, Tensor):
         """
         Based on the current environment state, get an action suggested by the agent
         :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
@@ -305,8 +206,9 @@ class AlphaRouterAgent(nn.Module):
 
             action = dist.sample()
             log_prob: Tensor = dist.log_prob(action)
+            print('log_prob size: {}', log_prob.size())
 
-        return action, log_prob
+        return action, log_prob, swap_scores
 
     def episode(self) -> (Tensor, int, int):
         """
@@ -333,7 +235,7 @@ class AlphaRouterAgent(nn.Module):
 
             state_embedding = embed_nodes(self.env._state, self.lookahead_length, self.device,
                                           self.qubit_embedding, self.embedding_dim, self.padding_dim)
-            action, log_prob = self.get_action(state_embedding.unsqueeze(0))
+            action, log_prob, _ = self.get_action(state_embedding.unsqueeze(0))
             observation, reward, done, truncated, info = self.env.step(action)
 
             self.replay_buffer.store(old_state, action, reward, self.env._state, done)
@@ -346,7 +248,7 @@ class AlphaRouterAgent(nn.Module):
                 self.success_count += 1
                 break
 
-        returns = self.compute_returns(rewards)
+        returns = compute_returns(rewards)
         policy_loss = []
         for log_prob, G_t in zip(log_probs, returns):
             policy_loss.append(-log_prob * G_t)
@@ -361,10 +263,10 @@ class AlphaRouterAgent(nn.Module):
         self.optimizer.zero_grad()
         # if not len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
         #     continue
-        mcts_input = self.replay_buffer.sample(1)
+        # mcts_input = self.replay_buffer.sample(1)
         # mcts_input = self.env._state
         # self.mcts.run(Node(mcts_input[0]))
-        mcts_reward = self.mcts.run(mcts_input[0])
+        # mcts_reward = self.mcts.run_parallel(mcts_input[0])
         # if mcts_reward is not None:
 
             # MCTS backprop / gradient step
@@ -393,8 +295,8 @@ class AlphaRouterAgent(nn.Module):
         self.optimizer.zero_grad()
 
         state_embeddings = torch.stack(
-            [embed_nodes(env._state, self.lookahead_length, self.device, self.qubit_embedding,
-                              self.embedding_dim, self.padding_dim) for env in self.vec_env.envs],
+            [embed_nodes(cur_env._state, self.lookahead_length, self.device, self.qubit_embedding,
+                              self.embedding_dim, self.padding_dim) for cur_env in self.vec_env.envs],
             dim=0
         ).to(self.device)
 
@@ -404,8 +306,9 @@ class AlphaRouterAgent(nn.Module):
         swaps = [self.episode_limit] * N_ENVS
 
         for step_idx in range(self.episode_limit):
+            old_states = [deepcopy(cur_env._state) for cur_env in self.vec_env.envs]
 
-            actions, log_probs = self.get_action(state_embeddings)
+            actions, log_probs, _ = self.get_action(state_embeddings)
 
             observations, rewards, terminated, truncated, info = self.vec_env.step(actions)
             done = np.logical_or(terminated, truncated)
@@ -427,10 +330,12 @@ class AlphaRouterAgent(nn.Module):
             ).to(self.device)
 
             for i in range(N_ENVS):
-                self.replay_buffer.store(state_embeddings[i], actions[i], reward_list[i][-1], new_embeddings[i], done_list[i])
+                self.replay_buffer.store(old_states[i], actions[i], reward_list[i][-1],
+                                         self.vec_env.envs[i]._state, done_list[i])
+                # self.replay_buffer.store(state_embeddings[i], actions[i], reward_list[i][-1], new_embeddings[i], done_list[i])
             state_embeddings = new_embeddings
 
-        returns, mask = self.compute_returns_batched(reward_list)
+        returns, mask = compute_returns_batched(reward_list, device=self.device)
 
         # Convert log_prob_list to tensor for fast on-device computation
         for i in range(N_ENVS):
@@ -441,7 +346,6 @@ class AlphaRouterAgent(nn.Module):
         # Policy gradient loss:
         #  per-episode sum_t (log_prob * G_t), then mean across batch
         # note: multiply by mask to ignore padding
-        # log_prob_list = torch.stack(log_prob_list, dim=0)
         per_episode_loss = - (log_prob_tensor * returns * mask).sum(dim=1)  # (B,)
         policy_loss = per_episode_loss.mean()
 
@@ -449,6 +353,26 @@ class AlphaRouterAgent(nn.Module):
         self.scaler.scale(policy_loss).backward()
         self.scaler.step(self.optimizer)
         self.scaler.update()
+
+
+        print(len(self.replay_buffer))
+
+        if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
+            mcts_input = self.replay_buffer.sample(MCTS_PROCESSES)
+            print(f'mcts_input: {mcts_input}')
+            mcts_actions, mcts_state_evals = self.mcts.run_parallel(mcts_input[0])
+            print(f'mcts_action: {mcts_actions}')
+
+            embeddings = torch.stack(
+                [embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
+                             self.embedding_dim, self.padding_dim) for state in mcts_input[0]],
+                dim=0
+            ).to(self.device)
+
+            transformer_actions, transformer_log_probs, transformer_state_evals = self.get_action(embeddings)
+            print(f'transformer_log_probs: {transformer_log_probs}')
+            # l1 = transformer_log_probs[mcts_actions].sum(dim=1)
+            print(f'### l1: {l1}')
 
         # Return undiscounted returns per env for plotting and analysis
         undiscounted_returns = torch.tensor([sum(r) for r in reward_list], dtype=torch.float32, device=returns.device)
@@ -495,6 +419,7 @@ class AlphaRouterAgent(nn.Module):
 
 
 if __name__ == '__main__':
+    print("Hello world")
     connection_graph = nx.Graph()
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
     connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
@@ -518,13 +443,13 @@ if __name__ == '__main__':
     print(f"cuda availability: {torch.cuda.is_available()}")
     print(f"device count: {torch.cuda.device_count()}")  # number of GPUs
     print(f"devices: {torch.cuda.get_device_name}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     print(f"device: {device}")
     model = AlphaRouterAgent(env, device).to(device)
 
     start = time.time()
-    model.learn(64, batch=False)
+    model.learn(256, batch=True)
     # model.learn(1024, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
