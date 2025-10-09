@@ -311,39 +311,55 @@ class MCTSWorker:
         return node, action
 
     def simulate(self, node: Node) -> Tensor:
-        state = deepcopy(node.state)
+        state = node.state
+        embedding = detach(embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
+                                        self.embedding_dim, self.padding_dim).cpu()).share_memory_()
 
-        log_probs = []
-        rewards = []
+        self.inference_queue.put((self.idx, embedding))
+        try:
+            action, state_eval = self.output_queue.get()
+        except:
+            state_eval = None
 
-        for step in range(self.max_depth):
-            if state.is_done():
-                break
+        return state_eval
 
-            embedding = detach(embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
-                                    self.embedding_dim, self.padding_dim).cpu()).share_memory_()
 
-            self.inference_queue.put((self.idx, embedding))
-
-            try:
-                action, log_prob = self.output_queue.get()
-            except:
-                break
-
-            old_state = deepcopy(state)
-            state.update_state(action)
-            reward = self.rewarder.compute_reward(old_state=old_state, action=action, new_state=state)
-
-            log_probs.append(log_prob)
-            rewards.append(reward)
-
-        returns = compute_returns(rewards)
-        policy_loss = []
-        for log_prob, G_t in zip(log_probs, returns):
-            policy_loss.append(-log_prob * G_t)
-        policy_loss = torch.stack(policy_loss).sum()
-
-        return policy_loss
+    # def simulate(self, node: Node) -> Tensor:
+    #     state = deepcopy(node.state)
+    #
+    #     # log_probs = []
+    #     rewards = []
+    #
+    #     for step in range(self.max_depth):
+    #         if state.is_done():
+    #             break
+    #
+    #         embedding = detach(embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
+    #                                 self.embedding_dim, self.padding_dim).cpu()).share_memory_()
+    #
+    #         self.inference_queue.put((self.idx, embedding))
+    #
+    #         try:
+    #             action, log_prob = self.output_queue.get()
+    #         except:
+    #             break
+    #
+    #         old_state = deepcopy(state)
+    #         state.update_state(action)
+    #         reward = self.rewarder.compute_reward(old_state=old_state, action=action, new_state=state)
+    #
+    #         # log_probs.append(log_prob)
+    #         rewards.append(reward)
+    #
+    #     # returns = compute_returns(rewards)
+    #     # policy_loss = []
+    #     # for log_prob, G_t in zip(log_probs, returns):
+    #     #     policy_loss.append(-log_prob * G_t)
+    #     # policy_loss = torch.stack(policy_loss).sum()
+    #
+    #     reward =
+    #
+    #     return policy_loss
 
     def backpropagate(self, path_states: list[RoutingState], path_actions: list[int], reward: Tensor):
         path_states.reverse()
@@ -382,8 +398,22 @@ class MCTSWorker:
         self.inference_queue.put((self.idx, None))
 
         best_action = self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]
-        state_eval = self.root.value
-        return best_action, state_eval
+        # state_evals = [node.value for node in self.root.children.keys()]
+        node_list = list(self.root.children.keys())
+        state_evals = [0] * self.swap_options
+
+        print(f'state_Evals: {state_evals}')
+
+        for i in range(len(node_list)):
+            node: Node = node_list[i]
+            print(f'node {i}: {node.visits}')
+            print(f'node {i}: {node.value}')
+            state_evals[i] = node.value
+
+        print(f'state_Evals2: {state_evals}')
+        # raise Exception
+
+        return best_action, state_evals
 
     # def update_tree(self, master_tree: Dict):
     #     self.transposition_table = master_tree.copy()
@@ -448,12 +478,12 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
         embeddings = [t for _, t in awaiting_states]
         embedding = torch.stack(embeddings, dim=0)
         # actions, log_probs = get_action(embedding, transformer, device)
-        actions, log_probs, _, _ = transformer(embedding)
+        actions, _, swap_scores, _ = transformer(embedding)
 
         for idx, (idx_sender, _) in enumerate(awaiting_states):
             if output_queues_states[idx_sender] is False:
                 continue
-            output_queues[idx_sender].put((detach(actions[idx].cpu()), detach(log_probs[idx].cpu())))
+            output_queues[idx_sender].put((detach(actions[idx].cpu()), detach(swap_scores[idx][actions[idx]].cpu())))
 
         awaiting_states.clear()
 
@@ -516,6 +546,7 @@ class ParallelMCTS:
 
         actions = [a.item() for a, _ in evaluated_roots]
         state_values = [v for _, v in evaluated_roots]
+        # state_values = [[state for state, _ in worker.root.children] for worker in self.workers]
         return actions, state_values
         # return [root.children[max(root.children.keys(), key=lambda child: child.value)] for root in evaluated_roots]
         # raise Exception

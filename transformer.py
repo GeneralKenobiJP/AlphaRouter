@@ -73,13 +73,13 @@ class TransformerLayer(nn.Module):
         return x
 
 
-def choose_action(transformer_output) -> (Tensor, Tensor, Tensor):
+def choose_action(transformer_output) -> (Tensor, Tensor, Tensor, Tensor):
     # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
 
     # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
     # as we want to output the optimal swap action
     swap_scores = transformer_output.sum(dim=1)
-    log_probs = torch.log_softmax(swap_scores, dim=-1)
+    log_probs: Tensor = torch.log_softmax(swap_scores, dim=-1)
     # softmax_output = torch.softmax(swap_scores, dim=-1)
     # dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
 

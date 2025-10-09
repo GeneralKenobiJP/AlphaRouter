@@ -17,6 +17,7 @@ from torch import nn, Tensor
 
 import graphviz
 from torch.amp import GradScaler, autocast
+from torch.nn import MSELoss
 from torch.types import Device
 from torchviz import make_dot
 
@@ -363,6 +364,7 @@ class AlphaRouterAgent(nn.Module):
             print(f'mcts_input: {mcts_input}')
             mcts_actions, mcts_state_evals = self.mcts.run_parallel(mcts_input[0])
             print(f'mcts_action: {mcts_actions}')
+            print(f'mcts_state_evals: {mcts_state_evals}')
 
             embeddings = torch.stack(
                 [embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
@@ -373,8 +375,11 @@ class AlphaRouterAgent(nn.Module):
             # transformer_actions, transformer_log_probs, transformer_state_evals = self.get_action(embeddings)
             transformer_actions, _, transformer_state_evals, transformer_all_log_probs = self.transformer(embeddings)
             print(f'transformer_log_probs: {transformer_all_log_probs}')
-            # l1 = transformer_log_probs[mcts_actions].sum(dim=1)
+            l1 = [batch_log_probs[idx] for batch_log_probs, idx in zip(transformer_all_log_probs, mcts_actions)]
             print(f'### l1: {l1}')
+            mcts_state_evals = torch.tensor(mcts_state_evals, dtype=transformer_all_log_probs.dtype, device=transformer_all_log_probs.device)
+            l2 = ((transformer_all_log_probs - mcts_state_evals)**2).sum(dim=1)
+            print(f'### l2: {l2}')
 
         # Return undiscounted returns per env for plotting and analysis
         undiscounted_returns = torch.tensor([sum(r) for r in reward_list], dtype=torch.float32, device=returns.device)
