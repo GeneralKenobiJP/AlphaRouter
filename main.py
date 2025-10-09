@@ -126,7 +126,8 @@ class ReplayBuffer:
 class AlphaRouterAgent(nn.Module):
     """The AlphaRouter routing agent"""
     def __init__(self, env: Routing, device: Device, embedding_dim: int = 20, num_heads: int = 6, ffn_dim: int = 64,
-                 num_layers: int = 4, lookahead_length: int = 48, buffer_size: int = int(1e6), *args, **kwargs):
+                 num_layers: int = 4, lookahead_length: int = 48, buffer_size: int = int(1e6),
+                 loss_coefficient: float = 0.05, *args, **kwargs):
         """
         :param env: Particular routing environment we want to apply the agent to
         :param device: Device to run the agent on (cuda for Nvidia graphics card, cpu for a standard cpu)
@@ -152,6 +153,8 @@ class AlphaRouterAgent(nn.Module):
         connection_graph = state.connection_graph
         self.qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(),
                                             embedding_dim=embedding_dim).to(self.device)
+        self.loss_coefficient = loss_coefficient
+        self.action_space_size = len(connection_graph.edges) + 1
 
         embedding_dim = embedding_dim + 1  # Embedding dim + 1 for depth
 
@@ -163,7 +166,7 @@ class AlphaRouterAgent(nn.Module):
         else:
             self.padding_dim = 0
 
-        self.transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length, swap_options=len(connection_graph.edges) + 1).to(self.device)
+        self.transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length, swap_options=self.action_space_size).to(self.device)
         self.replay_buffer = ReplayBuffer(
             buffer_size,
             self.device
@@ -375,11 +378,13 @@ class AlphaRouterAgent(nn.Module):
             # transformer_actions, transformer_log_probs, transformer_state_evals = self.get_action(embeddings)
             transformer_actions, _, transformer_state_evals, transformer_all_log_probs = self.transformer(embeddings)
             print(f'transformer_log_probs: {transformer_all_log_probs}')
-            l1 = [batch_log_probs[idx] for batch_log_probs, idx in zip(transformer_all_log_probs, mcts_actions)]
+            l1 = torch.stack([batch_log_probs[idx] for batch_log_probs, idx in zip(transformer_all_log_probs, mcts_actions)])
             print(f'### l1: {l1}')
             mcts_state_evals = torch.tensor(mcts_state_evals, dtype=transformer_all_log_probs.dtype, device=transformer_all_log_probs.device)
             l2 = ((transformer_all_log_probs - mcts_state_evals)**2).sum(dim=1)
             print(f'### l2: {l2}')
+            loss = (l1 + self.loss_coefficient * l2) / self.action_space_size
+            print(f'### loss: {loss}')
 
         # Return undiscounted returns per env for plotting and analysis
         undiscounted_returns = torch.tensor([sum(r) for r in reward_list], dtype=torch.float32, device=returns.device)
