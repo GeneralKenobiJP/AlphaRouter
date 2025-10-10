@@ -88,7 +88,6 @@ def choose_action(transformer_output) -> (Tensor, Tensor, Tensor, Tensor):
 
     action = dist.sample()
     action_log_prob: Tensor = dist.log_prob(action)
-    print('log_prob size: {}', action_log_prob.size())
 
     return action, action_log_prob, swap_scores, log_probs
 

@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Tuple
 
 import torch
 from qgym.envs.routing import RoutingState
-from torch import Tensor, nn, detach
+from torch import Tensor, nn, detach, NoneType
 from torch.amp import GradScaler, autocast
 from torch.nn import Embedding
 from torch.types import Device
@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from manhattan_rewarder import ManhattanRewarder
 from transformer import Transformer
-from utils import embed_nodes, compute_returns
+from utils import embed_nodes, compute_returns, boost_process_priority
 
 
 def gen_hash(state: RoutingState):
@@ -216,14 +216,13 @@ class MCTS:
 class MCTSWorker:
     def __init__(self, idx: int, qubit_embedding: nn.Embedding,
                  device: Device, swap_options: int, c: float = math.sqrt(2), rollouts: int = 200,
-                 max_depth: int = 100, lookahead_length: int = 48, embedding_dim: int = 24, padding_dim: int = 3):
+                 lookahead_length: int = 48, embedding_dim: int = 24, padding_dim: int = 3):
         self.root: Node | None = None
         self.transposition_table = dict()
         self.swap_options = swap_options
         self.c_constant = c
         self.qubit_embedding = qubit_embedding
         self.rollouts = rollouts
-        self.max_depth = max_depth
         self.device = device
         self.lookahead_length = lookahead_length
         self.embedding_dim = embedding_dim
@@ -398,22 +397,20 @@ class MCTSWorker:
         self.inference_queue.put((self.idx, None))
 
         best_action = self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]
+        # if best_action is NoneType:
+        #     best_action = Tensor(self.swap_options - 1, device=self.device) # todo: investigate what the fuck
+        #     print(f'states: {self.root.children.keys()}')
         # state_evals = [node.value for node in self.root.children.keys()]
         node_list = list(self.root.children.keys())
         state_evals = [0] * self.swap_options
 
-        print(f'state_Evals: {state_evals}')
-
         for i in range(len(node_list)):
             node: Node = node_list[i]
-            print(f'node {i}: {node.visits}')
-            print(f'node {i}: {node.value}')
+            # print(f'node {i}: {node.visits}')
+            # print(f'node {i}: {node.value}')
             state_evals[i] = node.value
 
-        print(f'state_Evals2: {state_evals}')
-        # raise Exception
-
-        return best_action, state_evals
+        return best_action.item(), state_evals
 
     # def update_tree(self, master_tree: Dict):
     #     self.transposition_table = master_tree.copy()
@@ -421,6 +418,8 @@ class MCTSWorker:
 
 def run_worker(worker: MCTSWorker, root_state: RoutingState, inference_queue: mp.Queue, output_queue: mp.Queue) -> (int, int):
     print(f"Running worker {worker.idx} with pid {os.getpid()}...")
+    boost_process_priority()
+
     worker.set_queues(inference_queue, output_queue)
     try:
         return worker.run(root_state)
@@ -455,12 +454,15 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
     output_queues_states: List[bool] = [True] * len(output_queues)
     running_processes_num = processes
 
+    boost_process_priority()
+
     # misses = 0
     while True:
         while len(awaiting_states) < running_processes_num:
             try:
                 awaiting_states.append(inference_queue.get(timeout=0.5))
-                # print(f'len(awaiting_states): {len(awaiting_states)}')
+                if len(awaiting_states) == 0:
+                    continue
                 if awaiting_states[-1] is None:
                     return
                 if awaiting_states[-1][-1] is None:
@@ -490,7 +492,7 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
 
 class ParallelMCTS:
     def __init__(self, transformer: Transformer, qubit_embedding: nn.Embedding,
-                 device: Device, swap_options: int, c: float = math.sqrt(2), rollouts: int = 200, max_depth: int = 100,
+                 device: Device, swap_options: int, c: float = math.sqrt(2), rollouts: int = 200,
                  lookahead_length: int = 48, embedding_dim: int = 24, padding_dim: int = 3, processes: int = 0):
         mp.set_start_method("spawn", force=True)
         self.c_constant = c
@@ -499,7 +501,6 @@ class ParallelMCTS:
         self.transformer.share_memory()
         self.qubit_embedding = qubit_embedding
         self.rollouts = rollouts
-        self.max_depth = max_depth
         self.device = device
         self.scaler = GradScaler(self.device.type)
         self.lookahead_length = lookahead_length
@@ -514,7 +515,7 @@ class ParallelMCTS:
         self.output_queues = [self.manager.Queue() for _ in range(self.processes)]
         self.workers: List[MCTSWorker] = [
             MCTSWorker(i, self.qubit_embedding, self.device, self.swap_options, self.c_constant,
-                       self.rollouts, self.max_depth, self.lookahead_length, self.embedding_dim, self.padding_dim)
+                       self.rollouts, self.lookahead_length, self.embedding_dim, self.padding_dim)
 
             for i in range(processes)
         ]
@@ -522,6 +523,9 @@ class ParallelMCTS:
 
     def run_parallel(self, root_states: List[RoutingState]) -> (List[int], List[float]):
         self.transformer.eval()
+
+        while self.inference_queue.qsize() > 0:
+            self.inference_queue.get()
 
         queue_loop = Process(target=inference_loop,
                              args=(self.processes, self.inference_queue, self.output_queues, self.transformer, self.device))
@@ -544,7 +548,7 @@ class ParallelMCTS:
             self.inference_queue.put(None)
             queue_loop.join()
 
-        actions = [a.item() for a, _ in evaluated_roots]
+        actions = [a for a, _ in evaluated_roots]
         state_values = [v for _, v in evaluated_roots]
         # state_values = [[state for state, _ in worker.root.children] for worker in self.workers]
         return actions, state_values
