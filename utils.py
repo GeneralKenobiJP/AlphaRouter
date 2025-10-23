@@ -1,4 +1,5 @@
 from collections import deque
+from sys import platform
 from typing import List, Set
 
 import numpy as np
@@ -215,3 +216,11 @@ def compute_returns_batched(reward_list: list[list[float]], device: Device, gamm
     returns = (returns - mean) / (std + 1e-8)
 
     return returns, mask
+
+def boost_process_priority():
+    if platform == 'Windows':
+        import win32api, win32process
+
+        h = win32api.GetCurrentProcess()
+        win32process.SetPriorityClass(h, win32process.REALTIME_PRIORITY_CLASS)
+        win32process.SetThreadPriority(h, win32process.THREAD_PRIORITY_TIME_CRITICAL)

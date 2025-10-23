@@ -1,7 +1,8 @@
 import math
 
 import torch
-from torch import nn
+from torch import nn, Tensor
+from torch.amp import autocast
 
 
 class PositionalEncoding(nn.Module):
@@ -72,6 +73,25 @@ class TransformerLayer(nn.Module):
         return x
 
 
+def choose_action(transformer_output) -> (Tensor, Tensor, Tensor, Tensor):
+    # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
+
+    # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
+    # as we want to output the optimal swap action
+    swap_scores = transformer_output.sum(dim=1)
+    log_probs: Tensor = torch.log_softmax(swap_scores, dim=-1)
+    # softmax_output = torch.softmax(swap_scores, dim=-1)
+    # dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
+
+    dist = torch.distributions.Categorical(logits=swap_scores, validate_args=False)
+    # action = dist.sample()
+
+    action = dist.sample()
+    action_log_prob: Tensor = dist.log_prob(action)
+
+    return action, action_log_prob, swap_scores, log_probs
+
+
 class Transformer(nn.Module):
     """
     Complete transformer encoder used in the agent with linear decoder
@@ -101,8 +121,10 @@ class Transformer(nn.Module):
         Pads the input accordingly, applies the transformer encoder and linear decoder
         :param x: input tensor
         """
+        # with autocast(self.device.type):
         x = self.positional_encoding(x)
 
         for layer in self.layers:
             x = layer(x)
-        return self.decoder(x)
+        output = self.decoder(x)
+        return choose_action(output)
