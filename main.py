@@ -17,7 +17,6 @@ from torch import nn, Tensor
 
 import graphviz
 from torch.amp import GradScaler, autocast
-from torch.nn import MSELoss
 from torch.types import Device
 from torchviz import make_dot
 
@@ -37,10 +36,10 @@ NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
 FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 8
+MCTS_PROCESSES: int = 10
 
-# REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
-REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
+REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
+# REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 def render_rgb(env):
     """Convenience method that we will use later on to display our results. Copied from notebooks"""
@@ -184,8 +183,8 @@ class AlphaRouterAgent(nn.Module):
 
         self.to(self.device)
 
-        self.scaler = GradScaler(self.device.type)
-        self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()), lr=0.001, weight_decay=0.1)
+        self.scaler = GradScaler(device=self.device.type)
+        self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()), lr=5e-5, weight_decay=1e-4)
 
         env_fns = [make_env(connection_graph, ManhattanRewarder()) for _ in range(N_ENVS)]
         self.vec_env = SyncVectorEnv(env_fns)
@@ -336,6 +335,9 @@ class AlphaRouterAgent(nn.Module):
             ).to(self.device)
 
             for i in range(N_ENVS):
+                if done_list[i]:
+                    # We do NOT want to run MCTS on terminal states, as it is a waste of time
+                    continue
                 self.replay_buffer.store(old_states[i], actions[i], reward_list[i][-1],
                                          self.vec_env.envs[i]._state, done_list[i])
                 # self.replay_buffer.store(state_embeddings[i], actions[i], reward_list[i][-1], new_embeddings[i], done_list[i])
@@ -363,6 +365,8 @@ class AlphaRouterAgent(nn.Module):
 
         # print(len(self.replay_buffer))
         loss = 0
+        l1 = 0
+        l2 = 0
         transformer_all_log_probs = torch.tensor([])
 
         if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
@@ -391,15 +395,17 @@ class AlphaRouterAgent(nn.Module):
             mean_loss = loss.mean()
             print(f'### mean_loss: {mean_loss}')
 
-            self.scaler.scale(mean_loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            # self.scaler.scale(mean_loss).backward()
+            # self.scaler.step(self.optimizer)
+            # self.scaler.update()
+            mean_loss.backward()
+            self.optimizer.step()
 
         # Return undiscounted returns per env for plotting and analysis
         # undiscounted_returns = torch.tensor([sum(r) for r in reward_list], dtype=torch.float32, device=self.device)
 
         # return policy_loss, swaps, undiscounted_returns
-        return loss.detach().cpu(), swaps, transformer_all_log_probs
+        return loss.detach().cpu(), swaps, transformer_all_log_probs, l1.detach().cpu(), l2.detach().cpu()
 
 
 
@@ -410,9 +416,13 @@ class AlphaRouterAgent(nn.Module):
         :param ma_window: The size of the moving average window used for filtering out noise in the graphs
         :batch: If true - computes in batches with B=N_ENV
         """
+        if total_timesteps % N_ENVS != 0:
+            total_timesteps -= (total_timesteps % N_ENVS)
         losses = []
         swaps = []
         returns = []
+        losses_l1 = []
+        losses_l2 = []
 
         if not batch:
             for i in range(int(total_timesteps)):
@@ -423,13 +433,17 @@ class AlphaRouterAgent(nn.Module):
         else:
             for i in range(int(total_timesteps // N_ENVS)):
                 print(f"Episode: {i * N_ENVS}...")
-                loss, ep_swaps, ep_return = self.batch()
+                loss, ep_swaps, ep_return, l1, l2 = self.batch()
                 swaps.extend(ep_swaps)
                 losses.extend(loss)
+                losses_l1.extend(l1)
+                losses_l2.extend(l2)
                 returns.extend(ep_return.detach().cpu())
 
         ma_swaps = moving_average(swaps, window=ma_window)
         ma_loss = moving_average(losses, window=ma_window)
+        ma_loss_l1 = moving_average(losses_l1, window=ma_window)
+        ma_loss_l2 = moving_average(losses_l2, window=ma_window)
         # ma_returns = moving_average(returns, window=ma_window)
 
         print(f"Success count: {self.success_count}")
@@ -440,9 +454,13 @@ class AlphaRouterAgent(nn.Module):
 
         plot(episodes, swaps, label='Swaps per Episode', xlabel='Episode', ylabel='Swaps', title='Swaps per Episode')
         plot(mcts_games, losses, label='Loss per MCTS games', xlabel='Game', ylabel='Loss', title='Loss per MCTS Games')
+        plot(mcts_games, losses_l1, label='Loss per MCTS games', xlabel='Game', ylabel='Loss', title='Loss L1 per MCTS Games')
+        plot(mcts_games, losses_l2, label='Loss per MCTS games', xlabel='Game', ylabel='Loss', title='Loss L2 per MCTS Games')
         # plot(episodes, returns, label=f'Returns per episode', xlabel='Episode', ylabel='Return', title='Returns per episode')
         plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title='Swaps per episode 50-Episode MA')
         plot(mcts_games, ma_loss, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title='Loss per MCTS games 50-Episode MA')
+        plot(mcts_games, ma_loss_l1, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title='Loss L1 per MCTS games 50-Episode MA')
+        plot(mcts_games, ma_loss_l2, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title='Loss L2 per MCTS games 50-Episode MA')
         # plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
 
 
@@ -467,7 +485,7 @@ if __name__ == '__main__':
         connection_graph=connection_graph,
         render_mode="rgb_array",
         rewarder=None,
-        interaction_generator=CustomInteractionGenerator()
+        # interaction_generator=CustomInteractionGenerator()
     )
 
     print(f"cuda version: {torch.version.cuda}")  # e.g. "11.8"
@@ -480,7 +498,7 @@ if __name__ == '__main__':
     model = AlphaRouterAgent(env, device, episode_limit=200).to(device)
 
     start = time.time()
-    model.learn(1024, batch=True)
+    model.learn(1024+512, batch=True)
     # model.learn(1024, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
