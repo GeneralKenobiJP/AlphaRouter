@@ -176,10 +176,6 @@ class AlphaRouterAgent(nn.Module):
                                  embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200,
                                  processes=MCTS_PROCESSES, merge_worker_trees=False)
         print("Init successful")
-        # self.mcts = MCTS(make_env(connection_graph, ManhattanRewarder())(), self.transformer,
-        #                  self.qubit_embedding, self.device, swap_options=len(connection_graph.edges) + 1,
-        #                  lookahead_length=self.lookahead_length, embedding_dim=self.embedding_dim,
-        #                  padding_dim=self.padding_dim, rollouts=15, max_depth=100)
 
         self.to(self.device)
 
@@ -510,7 +506,7 @@ if __name__ == '__main__':
 
     start = time.time()
     model.learn(1024+512, batch=True)
-    # model.learn(1024, batch=True)
+    # model.learn(64, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 

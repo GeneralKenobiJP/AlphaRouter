@@ -277,42 +277,26 @@ class MCTSWorker:
 
     def select_child(self, root: Node, path_states: List[RoutingState] = None) -> (Node, int):
         max_child = max(root.children.keys(), key=lambda child: -math.inf if child.state in path_states else self.ucb(root, child))
-        if max_child in path_states:
-            return None, -1
         action = root.children[max_child]
         return max_child, action
 
     def select(self, root: Node) -> (Node, bool, list[RoutingState], list[int]):
-        # print(f'worker: {self.idx} s1')
         node = root
-        # print(f'worker: {self.idx} s2')
         path_states = [root.state]
-        # print(f'worker: {self.idx} s3')
         path_actions = [0] # dummy 0 action to make the states dim and actions dim match (root does not need any action)
 
-        # print(f'worker: {self.idx} s4')
         while not node.is_terminal():
-            # print(f'worker: {self.idx} s5')
             if node.is_exhausted(self.swap_options):
-                # print(f'worker: {self.idx} s6')
                 node, action = self.select_child(node, path_states)
-                if node is None or node.state in path_states:
-                    # print(f'worker: {self.idx} None reported')
-                    # print(f'len path_states: {len(path_states)}')
-                    # print(f'len path_actions: {len(path_actions)}')
-                    # print(f'swap_options: {self.swap_options}')
-                    return None, True, path_states, path_actions
-                # print(f'worker: {self.idx} s7')
+                # Guard against loops
+                if node.state in path_states:
+                    return None, False, path_states, path_actions
                 path_states.append(node.state)
-                # print(f'worker: {self.idx} s8')
                 path_actions.append(action)
-                # print(f'worker: {self.idx} s9')
             else:
-                # print(f'worker: {self.idx} s10')
                 return node, False, path_states, path_actions
-        # print(f'worker: {self.idx} s11')
         node.value = len(node.state.interaction_circuit) - len(node.state.swap_gates_inserted) - 1
-        # print(f'worker: {self.idx} s12')
+
         return node, True, path_states, path_actions
 
     def get_transposition(self, hash: int) -> Optional[Node]:
@@ -387,33 +371,22 @@ class MCTSWorker:
                 node.value += reward
 
     def rollout(self, root: Node):
-        # print(f'worker: {self.idx} a')
         leaf_node, is_terminal, path_states, path_actions = self.select(root)
-        # print(f'worker: {self.idx} b')
         if leaf_node is None:
-            root.value = -1
-            root.visits += 1
             self.add_child(self.get_transposition(gen_hash(path_states[-1])), path_actions[-1], root.state)
-            return
+            return True
         if is_terminal:
-            # print(f'worker: {self.idx} c')
             self.backpropagate(path_states, path_actions, leaf_node.value)
-            # print(f'worker: {self.idx} d')
-            return
-            # returns.append(torch.tensor(leaf_node.value, device=self.device))
+            return False
 
-        # print(f'worker: {self.idx} e')
         node, action = self.expand(leaf_node)
-        # print(f'worker: {self.idx} f')
         path_states.append(node.state)
-        # print(f'worker: {self.idx} g')
         path_actions.append(action)
-        # print(f'worker: {self.idx} h')
 
         reward = self.simulate(node)
-        # print(f'worker: {self.idx} i')
         self.backpropagate(path_states, path_actions, reward)
-        # print(f'worker: {self.idx} j')
+
+        return False
 
     def run(self, root_state: RoutingState, clear_tree: bool = True) -> (int, float, dict):
         if clear_tree:
@@ -424,9 +397,10 @@ class MCTSWorker:
         with torch.no_grad():
             for i in range(self.rollouts):
                 print(f'worker{self.idx}: rollout {i}')
-                self.rollout(self.root)
-
-        start = time.time()
+                loop = self.rollout(self.root)
+                if loop:
+                    print(f'Loop detected. Rollouts truncated')
+                    break
 
         self.inference_queue.put((self.idx, None))
 
@@ -624,6 +598,8 @@ class ParallelMCTS:
                             self.signal_queues, self.result_queues, [None for _ in range(self.processes)]))
             [self.pool.submit(run_worker, *a) for a in args]
 
+            self.tree_queues = []
+
     def run_parallel(self, root_states: List[RoutingState]) -> (List[int], List[float]):
         self.transformer.eval()
 
@@ -641,8 +617,6 @@ class ParallelMCTS:
         for i in range(self.processes):
             evaluated_roots.append(self.result_queues[i].get())
 
-        start_huge = time.time()
-
         # Terminate the inference queue loop
         if queue_loop.is_alive():
             self.inference_queue.put(None)
@@ -650,9 +624,6 @@ class ParallelMCTS:
 
         actions = [a for a, _ in evaluated_roots]
         state_values = [v for _, v in evaluated_roots]
-
-        end_huge = time.time()
-        print(f'Huge took: {end_huge - start_huge} seconds')
 
         return actions, state_values
 
