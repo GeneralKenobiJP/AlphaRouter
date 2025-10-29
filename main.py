@@ -174,7 +174,7 @@ class AlphaRouterAgent(nn.Module):
         self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device,
                                  swap_options=len(connection_graph.edges) + 1, lookahead_length=self.lookahead_length,
                                  embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200,
-                                 processes=MCTS_PROCESSES)
+                                 processes=MCTS_PROCESSES, merge_worker_trees=False)
         print("Init successful")
         # self.mcts = MCTS(make_env(connection_graph, ManhattanRewarder())(), self.transformer,
         #                  self.qubit_embedding, self.device, swap_options=len(connection_graph.edges) + 1,

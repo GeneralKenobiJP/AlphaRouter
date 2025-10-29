@@ -452,7 +452,7 @@ class MCTSWorker:
 
 
 def run_worker(worker: MCTSWorker, inference_queue: mp.Queue, output_queue: mp.Queue,
-               signal_queue: mp.Queue, result_queue: mp.Queue, tree_queue: mp.Queue) -> (int, int):
+               signal_queue: mp.Queue, result_queue: mp.Queue, tree_queue: mp.Queue = None) -> (int, int):
     print(f"Running worker {worker.idx} with pid {os.getpid()}...")
     boost_process_priority()
 
@@ -464,23 +464,24 @@ def run_worker(worker: MCTSWorker, inference_queue: mp.Queue, output_queue: mp.Q
             # print(f'signal received: {root_state}')
             if root_state is None:
                 return
-            # if isinstance(root_state, Tuple) and root_state[0] is None:
-            #     tree = root_state[1]
-            #     worker.update_tree(tree)
-            #     print(f'worker: {worker.idx} updates tree:')
-            #     print(f'len {len(worker.transposition_table.keys())}')
+            if isinstance(root_state, Tuple) and root_state[0] is None:
+                tree = root_state[1]
+                worker.update_tree(tree)
+                print(f'worker: {worker.idx} updates tree:')
+                print(f'len {len(worker.transposition_table.keys())}')
             if isinstance(root_state, RoutingState):
                 result, tree = worker.run(root_state, clear_tree=False)
                 start = time.time()
                 result_queue.put(result)
                 end = time.time()
                 print(f'worker: {worker.idx} results sending took: {end - start} seconds')
-                # start = time.time()
-                # tree_queue.put(tree)
-                # new_tree = tree_queue.get()
-                # worker.update_tree(new_tree)
-                # end = time.time()
-                # print(f'worker: {worker.idx} processing merge took: {end - start} seconds')
+                if tree_queue is not None:
+                    start = time.time()
+                    tree_queue.put(tree)
+                    new_tree = tree_queue.get()
+                    worker.update_tree(new_tree)
+                    end = time.time()
+                    print(f'worker: {worker.idx} processing merge took: {end - start} seconds')
     except Exception as e:
         print(f"Worker {worker.idx} with pid {os.getpid()} died. Exception {e} caught. {e.__traceback__}")
         return
@@ -513,7 +514,6 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
 
     boost_process_priority()
 
-    # misses = 0
     while True:
         while len(awaiting_states) < running_processes_num or (running_processes_num == 0 and len(awaiting_states) == 0):
             try:
@@ -578,31 +578,12 @@ def merge_trees(tree_queues: List[mp.Queue]):
         end = time.time()
         print(f'Merge trees took: {end - start} seconds')
 
-    start = time.time()
-
-    new_dict = deepcopy(main_tree)
-
-    for worker in workers:
-        for hash, node in worker.transposition_table.items():
-            if hash in main_tree and node.state == main_tree[hash]:
-                new_dict[hash].value += node.value
-                new_dict[hash].visits += node.visits - main_tree[hash].visits
-            elif hash in new_dict and node.state == new_dict[hash]:
-                new_dict[hash].value += node.value
-                new_dict[hash].visits += node.visits
-            else:
-                new_dict[hash] = node
-
-    end = time.time()
-    print(f'Merge trees took: {end - start} seconds')
-
-    return new_dict
-
 
 class ParallelMCTS:
     def __init__(self, transformer: Transformer, qubit_embedding: nn.Embedding,
                  device: Device, swap_options: int, c: float = math.sqrt(2), rollouts: int = 200,
-                 lookahead_length: int = 48, embedding_dim: int = 24, padding_dim: int = 3, processes: int = 0):
+                 lookahead_length: int = 48, embedding_dim: int = 24, padding_dim: int = 3, processes: int = 0,
+                 merge_worker_trees: bool = False):
         mp.set_start_method("spawn", force=True)
         self.c_constant = c
         self.swap_options = swap_options
@@ -618,63 +599,32 @@ class ParallelMCTS:
         self.rewarder = ManhattanRewarder()
         self.processes = processes
         self.manager = mp.Manager()
-        # self.inference_queue = mp.Queue()
-        # self.output_queues = [mp.Queue() for _ in range(self.processes)]
         self.inference_queue = self.manager.Queue()
         self.output_queues = [self.manager.Queue() for _ in range(self.processes)]
         self.signal_queues = [self.manager.Queue() for _ in range(self.processes)]
         self.result_queues = [self.manager.Queue() for _ in range(self.processes)]
-        self.tree_queues = [self.manager.Queue() for _ in range(self.processes)]
         self.workers: List[MCTSWorker] = [
             MCTSWorker(i, self.qubit_embedding, self.device, self.swap_options, self.c_constant,
                        self.rollouts, self.lookahead_length, self.embedding_dim, self.padding_dim)
 
             for i in range(processes)
         ]
-        # self.pool = mp.Pool(processes=processes)
-        self.pool = ProcessPoolExecutor(max_workers=self.processes + 1)
-        self.dict = dict()
-        # self.merge_process: Process = Process(target=merge_trees, args=(self.dict, self.workers))
-        # self.merge_pool = ProcessPoolExecutor(max_workers=1)
-        # merge_process_args = list(zip(self.workers, self.tree_queues))
-        # self.merge_future = None
+        if merge_worker_trees:
+            self.tree_queues = [self.manager.Queue() for _ in range(self.processes)]
+            self.pool = ProcessPoolExecutor(max_workers=self.processes + 1)
 
-        args = list(zip(self.workers, [self.inference_queue] * self.processes, self.output_queues,
-                        self.signal_queues, self.result_queues, self.tree_queues))
-        [self.pool.submit(run_worker, *a) for a in args]
-        self.pool.submit(merge_trees, *self.tree_queues)
+            args = list(zip(self.workers, [self.inference_queue] * self.processes, self.output_queues,
+                            self.signal_queues, self.result_queues, self.tree_queues))
+            [self.pool.submit(run_worker, *a) for a in args]
+            self.pool.submit(merge_trees, *self.tree_queues)
+        else:
+            self.pool = ProcessPoolExecutor(max_workers=self.processes)
 
-    # def merge_trees(self):
-    #     new_dict = deepcopy(self.dict)
-    #     for worker in self.workers:
-    #         for hash, node in worker.transposition_table.items():
-    #             if hash in self.dict and node.state == self.dict[hash]:
-    #                 new_dict[hash].value += node.value
-    #                 new_dict[hash].visits += node.visits - self.dict[hash].visits
-    #             elif hash in new_dict and node.state == new_dict[hash]:
-    #                 new_dict[hash].value += node.value
-    #                 new_dict[hash].visits += node.visits
-    #             else:
-    #                 new_dict[hash] = node
-    #
-    #     self.dict = new_dict
-    #
-    #     for worker in self.workers:
-    #         worker.update_tree(self.dict)
-
-    # def merge_trees(self):
-    #     self.merge_process = Process(target=merge_trees, args=(self.dict, self.workers))
-    #     self.merge_process.start()
-
+            args = list(zip(self.workers, [self.inference_queue] * self.processes, self.output_queues,
+                            self.signal_queues, self.result_queues, [None for _ in range(self.processes)]))
+            [self.pool.submit(run_worker, *a) for a in args]
 
     def run_parallel(self, root_states: List[RoutingState]) -> (List[int], List[float]):
-        # if self.merge_future is not None:
-        #     self.dict = self.merge_future.result()
-        #     for queue in self.signal_queues:
-        #         queue.put((None, self.dict))
-        #     # for worker in self.workers:
-        #         # worker.update_tree(self.dict)
-
         self.transformer.eval()
 
         while self.inference_queue.qsize() > 0:
@@ -698,22 +648,13 @@ class ParallelMCTS:
             self.inference_queue.put(None)
             queue_loop.join()
 
-        # for idx, (_, _, tree) in enumerate(evaluated_roots):
-        #     self.workers[idx].transposition_table = tree
-
-        # self.merge_future = self.merge_pool.submit(merge_trees, *self.merge_process_args)
-        # self.merge_future = self.pool.submit(merge_trees, *self.merge_process_args)
-
         actions = [a for a, _ in evaluated_roots]
         state_values = [v for _, v in evaluated_roots]
 
         end_huge = time.time()
         print(f'Huge took: {end_huge - start_huge} seconds')
 
-        # state_values = [[state for state, _ in worker.root.children] for worker in self.workers]
         return actions, state_values
-        # return [root.children[max(root.children.keys(), key=lambda child: child.value)] for root in evaluated_roots]
-        # raise Exception
 
     def close_workers(self):
         for queue in self.signal_queues:
@@ -722,5 +663,3 @@ class ParallelMCTS:
             queue.put(None)
             queue.put(None)
         self.pool.shutdown()
-        # if self.merge_future is not None:
-        #     self.merge_future.result()
