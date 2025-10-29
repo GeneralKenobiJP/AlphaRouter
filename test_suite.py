@@ -1,3 +1,4 @@
+import math
 from copy import deepcopy
 
 import networkx as nx
@@ -5,13 +6,182 @@ import pytest
 import torch
 import numpy as np
 from qgym.envs import Routing
+from qgym.envs.routing import RoutingState
+from qgym.generators import BasicInteractionGenerator
 from torch import nn, Tensor, tensor
 
 from custom_interaction_generator import CustomInteractionGenerator
 from main import ReplayBuffer, ManhattanRewarder, AlphaRouterAgent, \
     LOOKAHEAD_LENGTH
-from mcts import MCTS, gen_hash, MCTSWorker, inference_loop
+from mcts import MCTS, gen_hash, MCTSWorker, inference_loop, Node
 from transformer import PositionalEncoding, TransformerLayer, Transformer
+from utils import compare_routing_states
+
+
+# --- utils ---
+def test_compare_routing_states():
+    connection_graph = nx.Graph()
+    connection_graph.add_edges_from([(0, 1), (1, 2)])
+
+    interaction_generator = BasicInteractionGenerator(seed=0)
+    interaction_generator.set_state_attributes(connection_graph=connection_graph)
+
+    state1 = RoutingState(interaction_generator=interaction_generator, max_observation_reach=40, connection_graph=connection_graph, observe_legal_surpasses=True, observe_connection_graph=True)
+    state2 = RoutingState(interaction_generator=interaction_generator, max_observation_reach=40, connection_graph=connection_graph, observe_legal_surpasses=True, observe_connection_graph=True)
+
+    state1.reset()
+    state2.reset()
+
+    state2.mapping = deepcopy(state1.mapping)
+    state2.interaction_circuit = deepcopy(state1.interaction_circuit)
+
+    assert compare_routing_states(state1, state2) == True
+
+    state2.update_state(1)
+
+    assert compare_routing_states(state1, state2) == False
+
+# --- Node ---
+def test_hash():
+    connection_graph = nx.Graph()
+    connection_graph.add_edges_from([(0, 1), (1, 2)])
+
+    interaction_generator = BasicInteractionGenerator(seed=0)
+    interaction_generator.set_state_attributes(connection_graph=connection_graph)
+
+    state1 = RoutingState(interaction_generator=interaction_generator, max_observation_reach=40, connection_graph=connection_graph, observe_legal_surpasses=True, observe_connection_graph=True)
+    state2 = RoutingState(interaction_generator=interaction_generator, max_observation_reach=40, connection_graph=connection_graph, observe_legal_surpasses=True, observe_connection_graph=True)
+
+    state1.reset()
+    state2.reset()
+
+    state2.mapping = deepcopy(state1.mapping)
+    state2.interaction_circuit = deepcopy(state1.interaction_circuit)
+
+    node1 = Node(state1)
+    node2 = Node(state2)
+
+    assert gen_hash(state1) == gen_hash(state2)
+    assert hash(node1) == hash(node2)
+    assert node1 == node2
+
+    state2.update_state(1)
+    node3 = Node(state2)
+
+    assert gen_hash(state1) != gen_hash(state2)
+    assert hash(node1) != hash(node3)
+    assert node1 != node3
+
+# -- Transpositions
+def test_transpositions():
+    connection_graph = nx.Graph()
+    connection_graph.add_edges_from([(0, 1), (1, 2)])
+
+    interaction_generator = BasicInteractionGenerator(seed=0)
+    interaction_generator.set_state_attributes(connection_graph=connection_graph)
+
+    state1 = RoutingState(interaction_generator=interaction_generator, max_observation_reach=40,
+                          connection_graph=connection_graph, observe_legal_surpasses=True,
+                          observe_connection_graph=True)
+    state2 = RoutingState(interaction_generator=interaction_generator, max_observation_reach=40,
+                          connection_graph=connection_graph, observe_legal_surpasses=True,
+                          observe_connection_graph=True)
+
+    mcts = MCTSWorker(idx=0, qubit_embedding=None, device=torch.device('cpu'), swap_options=4)
+
+    state1.reset()
+    state2.reset()
+
+    state2.mapping = deepcopy(state1.mapping)
+    state2.interaction_circuit = deepcopy(state1.interaction_circuit)
+
+    node1 = Node(state1)
+    node2 = Node(state2)
+
+    mcts.put_transposition(gen_hash(node1.state), node1)
+
+    assert len(mcts.transposition_table) == 1
+    assert mcts.get_transposition(gen_hash(node2.state)) == node1
+
+    state3 = deepcopy(state2)
+    state3.update_state(1)
+    node3 = Node(state3)
+
+    mcts.put_transposition(gen_hash(node3.state), node3)
+
+    assert len(mcts.transposition_table) == 2
+    assert mcts.get_transposition(gen_hash(node1.state)) == node1
+    assert mcts.get_transposition(gen_hash(node3.state)) == node3
+
+    mcts.put_transposition(gen_hash(node2.state), node2)
+    assert len(mcts.transposition_table) == 2
+
+class MockNode:
+    def __init__(self, state):
+        self.state = state
+        self.children = dict()
+        self.hash = 0
+        self.value = 5
+        self.visits = 3
+
+    def is_leaf_node(self) -> bool:
+        return len(self.children) == 0
+
+    def is_terminal(self) -> bool:
+        return False
+
+    def is_exhausted(self, swap_options: int = 0) -> bool:
+        return len(self.children) == 1
+
+    def __hash__(self):
+        if self.hash == 0:
+            self.hash = gen_hash(self.state)
+        return self.hash
+
+    def __eq__(self, other):
+        if not isinstance(other, Node):
+            return False
+        if self.visits != other.visits:
+            return False
+        if not math.isclose(self.value, other.value):
+            return False
+        if not self.children == other.children:
+            return False
+        return compare_routing_states(self.state, other.state)
+
+def test_loop_selection():
+    connection_graph = nx.Graph()
+    connection_graph.add_edges_from([(0, 1), (1, 2)])
+
+    mcts = MCTSWorker(idx=0, qubit_embedding=None, device=torch.device('cpu'), swap_options=4)
+
+    interaction_generator = BasicInteractionGenerator(seed=0)
+    interaction_generator.set_state_attributes(connection_graph=connection_graph)
+
+    parent: MockNode = None
+
+    state_template = RoutingState(interaction_generator=interaction_generator, max_observation_reach=40,
+                         connection_graph=connection_graph, observe_legal_surpasses=True,
+                         observe_connection_graph=True)
+
+    for i in range(4):
+        state = deepcopy(state_template)
+        state.reset()
+
+        node = MockNode(state)
+        mcts.put_transposition(gen_hash(state), node)
+        if parent is not None:
+            parent.children[node] = 0
+            parent = node
+        if i == 0:
+            mcts.root = node
+            parent = node
+
+    parent.children[mcts.root] = 0
+
+    leaf_node, is_terminal, path_states, path_actions = mcts.select(mcts.root)
+
+    assert leaf_node is None
 
 
 # --- PositionalEncoding tests ---
