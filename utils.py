@@ -224,3 +224,49 @@ def boost_process_priority():
         h = win32api.GetCurrentProcess()
         win32process.SetPriorityClass(h, win32process.REALTIME_PRIORITY_CLASS)
         win32process.SetThreadPriority(h, win32process.THREAD_PRIORITY_TIME_CRITICAL)
+
+def compare_routing_states(state1: RoutingState, state2: RoutingState) -> bool:
+    if not (isinstance(state1, RoutingState) and isinstance(state2, RoutingState)):
+        return False
+    if not state1.connection_graph.number_of_nodes() == state2.connection_graph.number_of_nodes():
+        return False
+    if not state1.n_connections == state2.n_connections:
+        return False
+    if not state1.n_qubits == state2.n_qubits:
+        return False
+    edges1 = set(state1.connection_graph.edges)
+    edges2 = set(state2.connection_graph.edges)
+    if not edges1 == edges2:
+        return False
+    if not np.array_equal(state1.interaction_circuit, state2.interaction_circuit):
+        return False
+    if not np.array_equal(state1.mapping, state2.mapping):
+        return False
+
+    return True
+
+# def compare_routing_states(state1: RoutingState, state2: RoutingState) -> bool:
+#     if not (isinstance(state1, RoutingState) and isinstance(state2, RoutingState)):
+#         return False
+#     if not state1.connection_graph.number_of_nodes() == state2.connection_graph.number_of_nodes():
+#         return False
+#     if not state1.n_connections == state2.n_connections:
+#         return False
+#     if not state1.n_qubits == state2.n_qubits:
+#         return False
+#     edges1 = set(state1.connection_graph.edges)
+#     edges2 = set(state2.connection_graph.edges)
+#     if not edges1 == edges2:
+#         return False
+#     if not np.array_equal(state1.interaction_circuit, state2.interaction_circuit):
+#         return False
+#     if not state1.swap_gates_inserted == state2.swap_gates_inserted:
+#         return False
+#     if not np.array_equal(state1.mapping, state2.mapping):
+#         return False
+#     if not state1.position == state2.position:
+#         return False
+#     if not state1.steps_done == state2.steps_done:
+#         return False
+#
+#     return True

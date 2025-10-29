@@ -36,7 +36,7 @@ NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
 FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 10
+MCTS_PROCESSES: int = 8
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
@@ -364,9 +364,9 @@ class AlphaRouterAgent(nn.Module):
 
 
         # print(len(self.replay_buffer))
-        loss = 0
-        l1 = 0
-        l2 = 0
+        loss = []
+        l1 = []
+        l2 = []
         transformer_all_log_probs = torch.tensor([])
 
         if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
@@ -405,7 +405,13 @@ class AlphaRouterAgent(nn.Module):
         # undiscounted_returns = torch.tensor([sum(r) for r in reward_list], dtype=torch.float32, device=self.device)
 
         # return policy_loss, swaps, undiscounted_returns
-        return loss.detach().cpu(), swaps, transformer_all_log_probs, l1.detach().cpu(), l2.detach().cpu()
+        if isinstance(loss, torch.Tensor):
+            loss = loss.detach().cpu()
+        if isinstance(l1, torch.Tensor):
+            l1 = l1.detach().cpu()
+        if isinstance(l2, torch.Tensor):
+            l2 = l2.detach().cpu()
+        return loss, swaps, transformer_all_log_probs, l1, l2
 
 
 
@@ -440,6 +446,8 @@ class AlphaRouterAgent(nn.Module):
                 losses_l2.extend(l2)
                 returns.extend(ep_return.detach().cpu())
 
+        self.mcts.close_workers()
+
         ma_swaps = moving_average(swaps, window=ma_window)
         ma_loss = moving_average(losses, window=ma_window)
         ma_loss_l1 = moving_average(losses_l1, window=ma_window)
@@ -470,8 +478,11 @@ if __name__ == '__main__':
     boost_process_priority()
 
     connection_graph = nx.Graph()
+    # connection_graph.add_edges_from([(0,1), (1,2)])
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
+
     connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
+
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (5,6), (6,7), (7,8), (8,9), (10,11),(11,12),(12,13), (13,14), (0,5), (5, 10), (1, 6), (6,11), (2,7), (7,12), (3,8), (8,13), (4,9), (9,14)])
     # width = 5
     nx.draw(connection_graph, with_labels=True)
@@ -495,7 +506,7 @@ if __name__ == '__main__':
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device("cpu")
     print(f"device: {device}")
-    model = AlphaRouterAgent(env, device, episode_limit=200).to(device)
+    model = AlphaRouterAgent(env, device, episode_limit=250).to(device)
 
     start = time.time()
     model.learn(1024+512, batch=True)
