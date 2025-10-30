@@ -3,6 +3,7 @@ import sys
 import time
 from collections import deque
 from copy import deepcopy
+from pathlib import Path
 from typing import List, Set, Union
 
 import networkx as nx
@@ -36,10 +37,12 @@ NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
 FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 8
+MCTS_PROCESSES: int = 10
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
+
+MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 
 def render_rgb(env):
     """Convenience method that we will use later on to display our results. Copied from notebooks"""
@@ -137,6 +140,7 @@ class AlphaRouterAgent(nn.Module):
         :param lookahead_length: The maximal number of the gates ahead that we will analyze
         :param buffer_size: Size of the replay buffer (its capacity)
         """
+        print('Init')
         super().__init__(*args, **kwargs)
         self.device = device
         self.env = env
@@ -152,7 +156,7 @@ class AlphaRouterAgent(nn.Module):
         connection_graph = state.connection_graph
         self.qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(),
                                             embedding_dim=embedding_dim).to(self.device)
-        self.loss_coefficient = loss_coefficient # f(x)=-0.0002675675676x+0.05401351351
+        self.loss_coefficient = loss_coefficient
         self.action_space_size = len(connection_graph.edges) + 1
 
         embedding_dim = embedding_dim + 1  # Embedding dim + 1 for depth
@@ -170,20 +174,17 @@ class AlphaRouterAgent(nn.Module):
             buffer_size,
             self.device
         )
-        print("Init")
-        self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device,
-                                 swap_options=len(connection_graph.edges) + 1, lookahead_length=self.lookahead_length,
-                                 embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200,
-                                 processes=MCTS_PROCESSES, merge_worker_trees=False)
-        print("Init successful")
+        self.mcts: ParallelMCTS | None = None
 
         self.to(self.device)
 
         self.scaler = GradScaler(device=self.device.type)
         self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()), lr=5e-5, weight_decay=1e-4)
 
-        env_fns = [make_env(connection_graph, ManhattanRewarder()) for _ in range(N_ENVS)]
+        env_fns = [make_env(connection_graph) for _ in range(N_ENVS)]
         self.vec_env = SyncVectorEnv(env_fns)
+
+        print('Init successful')
 
     def get_action(self, node_embedding) -> (Tensor, Tensor, Tensor):
         """
@@ -314,10 +315,16 @@ class AlphaRouterAgent(nn.Module):
             observations, rewards, terminated, truncated, info = self.vec_env.step(actions)
             done = np.logical_or(terminated, truncated)
 
+            # observations, rewards, terminated, truncated, info = self.vec_env.step(np.full((N_ENVS,), self.action_space_size))
+            # done = np.logical_or(terminated, truncated)
+
             for i in range(N_ENVS):
+                # print(self.vec_env.envs[0]._state)
                 if done_list[i]:
                     continue
                 if done[i]:
+                    # print("DONE KURWA DONE")
+                    # print(f'DONE STATE mapping: {self.vec_env.envs[0]._state.mapping}')
                     done_list[i] = True
                     swaps[i] = step_idx
                     self.success_count += 1
@@ -418,6 +425,13 @@ class AlphaRouterAgent(nn.Module):
         :param ma_window: The size of the moving average window used for filtering out noise in the graphs
         :batch: If true - computes in batches with B=N_ENV
         """
+        print("MCTS Init")
+        self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device,
+                                 swap_options=self.action_space_size, lookahead_length=self.lookahead_length,
+                                 embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200,
+                                 processes=MCTS_PROCESSES, merge_worker_trees=False)
+        print("MCTS Init successful")
+
         if total_timesteps % N_ENVS != 0:
             total_timesteps -= (total_timesteps % N_ENVS)
         losses = []
@@ -467,6 +481,30 @@ class AlphaRouterAgent(nn.Module):
         plot(mcts_games, ma_loss_l2, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title='Loss L2 per MCTS games 50-Episode MA')
         # plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
 
+    def forward(self, env: Routing):
+        state: RoutingState = env._state
+
+        assert len(state.connection_graph.edges) + 1 == self.action_space_size
+
+        actions = []
+
+        for i in range(self.episode_limit):
+            node_embedding = embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
+                        self.embedding_dim, self.padding_dim)
+            node_embedding = node_embedding.unsqueeze(0)  # now shape (1, T, E)
+            transformer_action, _, _, _ = self.transformer(node_embedding)
+
+            observation, reward, done, truncated, info = env.step(transformer_action)
+            # print(env._state)
+            actions.append(transformer_action)
+
+            if done:
+                return actions
+
+        print(f'Failed to schedule a correct circuit within the action limit.', file=sys.stderr)
+
+        return actions
+
 
 if __name__ == '__main__':
     print("Hello world")
@@ -492,7 +530,7 @@ if __name__ == '__main__':
         connection_graph=connection_graph,
         render_mode="rgb_array",
         rewarder=None,
-        # interaction_generator=CustomInteractionGenerator()
+        interaction_generator=CustomInteractionGenerator()
     )
 
     print(f"cuda version: {torch.version.cuda}")  # e.g. "11.8"
@@ -505,8 +543,7 @@ if __name__ == '__main__':
     model = AlphaRouterAgent(env, device, episode_limit=250).to(device)
 
     start = time.time()
-    model.learn(1024+512, batch=True)
-    # model.learn(64, batch=True)
+    model.learn(1024, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
@@ -514,6 +551,42 @@ if __name__ == '__main__':
     print("Gradients flowing:", has_grad)
 
     print('Successful execution')
+
+    # model.eval()
+    #
+    # for i in range(100):
+    #     env.reset()
+    #     actions = model(env)
+    #     print('### ### ###')
+    #     print(f'len(actions): {len(actions)}')
+    #     print(f'actions: {actions}')
+    #
+    # print('Successful inference')
+
+    path = MODEL_DIR.joinpath("model_B.pt")
+    print(path)
+
+    torch.save(model.state_dict(), path)
+    print(f"Model saved: {model.state_dict()}")
+
+    print('Model saved successfully')
+
+    inference_model = AlphaRouterAgent(env, device, episode_limit=400).to(device)
+    inference_model.load_state_dict(torch.load(path, weights_only=True))
+    inference_model.eval()
+    # inference_model.train()
+    print('Model loaded successfully')
+    print(f"Model loaded: {inference_model.state_dict()}")
+
+    for i in range(10):
+        env.reset()
+        actions = inference_model(env)
+        print('### ### ###')
+        print(f'len(actions): {len(actions)}')
+        print(f'actions: {actions}')
+
+    print('Successful inference')
+
     # B = 32
     # 165.20124554634094
     # 104.16623425483704
