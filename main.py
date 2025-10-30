@@ -157,7 +157,7 @@ class AlphaRouterAgent(nn.Module):
         self.qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(),
                                             embedding_dim=embedding_dim).to(self.device)
         self.loss_coefficient = loss_coefficient
-        self.action_space_size = len(connection_graph.edges) + 1
+        self.action_space_size = len(connection_graph.edges)
 
         embedding_dim = embedding_dim + 1  # Embedding dim + 1 for depth
 
@@ -301,35 +301,30 @@ class AlphaRouterAgent(nn.Module):
             dim=0
         ).to(self.device)
 
-        log_prob_list = [[] for _ in range(N_ENVS)]
-        reward_list = [[] for _ in range(N_ENVS)]
         done_list = [False] * N_ENVS
         swaps = [self.episode_limit] * N_ENVS
 
         for step_idx in range(self.episode_limit):
             old_states = [deepcopy(cur_env._state) for cur_env in self.vec_env.envs]
 
-            # actions, log_probs, _ = self.get_action(state_embeddings)
-            actions, log_probs, _, _ = self.transformer(state_embeddings)
+            actions, _, _, _ = self.transformer(state_embeddings)
 
             observations, rewards, terminated, truncated, info = self.vec_env.step(actions)
             done = np.logical_or(terminated, truncated)
 
-            # observations, rewards, terminated, truncated, info = self.vec_env.step(np.full((N_ENVS,), self.action_space_size))
-            # done = np.logical_or(terminated, truncated)
+            observations, rewards, terminated, truncated, info = self.vec_env.step(np.full((N_ENVS,), self.action_space_size))
+            done = np.logical_or(terminated, truncated, done)
 
             for i in range(N_ENVS):
                 # print(self.vec_env.envs[0]._state)
                 if done_list[i]:
                     continue
                 if done[i]:
-                    # print("DONE KURWA DONE")
-                    # print(f'DONE STATE mapping: {self.vec_env.envs[0]._state.mapping}')
+                    print("DONE KURWA DONE")
+                    print(f'DONE STATE mapping: {self.vec_env.envs[0]._state.mapping}')
                     done_list[i] = True
                     swaps[i] = step_idx
                     self.success_count += 1
-                log_prob_list[i].append(log_probs[i])
-                reward_list[i].append(rewards[i])
 
             new_embeddings = torch.stack(
                 [embed_nodes(env._state, self.lookahead_length, self.device, self.qubit_embedding,
@@ -341,9 +336,8 @@ class AlphaRouterAgent(nn.Module):
                 if done_list[i]:
                     # We do NOT want to run MCTS on terminal states, as it is a waste of time
                     continue
-                self.replay_buffer.store(old_states[i], actions[i], reward_list[i][-1],
+                self.replay_buffer.store(old_states[i], actions[i], None,
                                          self.vec_env.envs[i]._state, done_list[i])
-                # self.replay_buffer.store(state_embeddings[i], actions[i], reward_list[i][-1], new_embeddings[i], done_list[i])
             state_embeddings = new_embeddings
 
         # returns, mask = compute_returns_batched(reward_list, device=self.device)
@@ -484,7 +478,7 @@ class AlphaRouterAgent(nn.Module):
     def forward(self, env: Routing):
         state: RoutingState = env._state
 
-        assert len(state.connection_graph.edges) + 1 == self.action_space_size
+        assert len(state.connection_graph.edges) == self.action_space_size
 
         actions = []
 
@@ -495,8 +489,10 @@ class AlphaRouterAgent(nn.Module):
             transformer_action, _, _, _ = self.transformer(node_embedding)
 
             observation, reward, done, truncated, info = env.step(transformer_action)
-            # print(env._state)
             actions.append(transformer_action)
+
+            if bool(observation['is_legal_surpass'][0]):
+                observation, reward, done, truncated, info = env.step(self.action_space_size)
 
             if done:
                 return actions
@@ -563,7 +559,7 @@ if __name__ == '__main__':
     #
     # print('Successful inference')
 
-    path = MODEL_DIR.joinpath("model_B.pt")
+    path = MODEL_DIR.joinpath("model_C.pt")
     print(path)
 
     torch.save(model.state_dict(), path)

@@ -18,7 +18,8 @@ from tqdm import tqdm
 
 from manhattan_rewarder import ManhattanRewarder
 from transformer import Transformer
-from utils import embed_nodes, compute_returns, boost_process_priority, compare_routing_states
+from utils import embed_nodes, compute_returns, boost_process_priority, compare_routing_states, \
+    surpass_all_possible_gates
 
 mp.set_start_method("spawn", force=True)
 
@@ -257,6 +258,7 @@ class MCTSWorker:
         self.idx = idx
 
     def set_root(self, state: RoutingState) -> None:
+        surpass_all_possible_gates(state)
         hash = gen_hash(state)
         node = self.get_transposition(hash)
         if node is None:
@@ -308,6 +310,7 @@ class MCTSWorker:
         self.transposition_table[hash] = node
 
     def add_child(self, parent: Node, action: int | Tensor, child_state: RoutingState) -> Node:
+        surpass_all_possible_gates(child_state)
         hash = gen_hash(child_state)
         node = self.get_transposition(hash)
         if node is None:
