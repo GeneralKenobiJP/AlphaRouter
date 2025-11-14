@@ -1,19 +1,22 @@
 import math
+import pickle
 import sys
 import time
 from collections import deque
 from copy import deepcopy
 from pathlib import Path
-from typing import List, Set, Union
+from typing import List, Set, Union, Hashable, Any, Optional
 
 import networkx as nx
 import numpy as np
 import torch
+from networkx.algorithms.coloring.greedy_coloring import _Node
 from qgym.envs import Routing
 from qgym.envs.routing import RoutingState
 import matplotlib.pyplot as plt
 import random
 
+from qgym.generators.interaction import InteractionGenerator
 from torch import nn, Tensor
 
 import graphviz
@@ -23,13 +26,14 @@ from torchviz import make_dot
 
 from custom_interaction_generator import CustomInteractionGenerator
 from mcts import ParallelMCTS
-from plotting import moving_average, plot
+from plotting import moving_average, plot, plot_mapping_and_circuit
 from manhattan_rewarder import ManhattanRewarder
 
 from gymnasium.vector import SyncVectorEnv
 
 from transformer import Transformer
-from utils import NormalizeInfoWrapper, embed_nodes, compute_returns, compute_returns_batched, boost_process_priority
+from utils import NormalizeInfoWrapper, embed_nodes, compute_returns, compute_returns_batched, boost_process_priority, \
+    open_binary, get_timestamp
 
 EMBEDDING_DIM = 20      # AR paper embedding dimension
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length
@@ -42,7 +46,13 @@ MCTS_PROCESSES: int = 10
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
+LEARNING_RATE = 1e-1
+WEIGHT_DECAY = 1e-4
+
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
+TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
+TEMP_BUFFER_DIR = TEMP_MODEL_DIR.joinpath('buffers/')
+LOG_DIR = Path(__file__).resolve().parent.joinpath('logs/')
 
 def render_rgb(env):
     """Convenience method that we will use later on to display our results. Copied from notebooks"""
@@ -53,7 +63,7 @@ def render_rgb(env):
     plt.show()
 
 
-def make_env(connection_graph, rewarder=None):
+def make_env(connection_graph, interaction_generator: InteractionGenerator = None, rewarder=None):
     def _thunk():
         env = Routing(
             max_observation_reach=LOOKAHEAD_LENGTH,
@@ -62,7 +72,8 @@ def make_env(connection_graph, rewarder=None):
             connection_graph=connection_graph,
             render_mode="rgb_array",
             rewarder=rewarder,
-            interaction_generator=CustomInteractionGenerator()
+            interaction_generator=interaction_generator
+            # interaction_generator=CustomInteractionGenerator()
         )
         # env.seed(seed)
         env = NormalizeInfoWrapper(env)
@@ -96,9 +107,10 @@ class ReplayBuffer:
         We detach and move everything to CPU to avoid pinning GPU memory.
         """
         # ensure everything is on CPU and detached
-        stored_action = (action.detach() if isinstance(action, torch.Tensor)
-                         else action)
-        self.buffer.append((state, stored_action, reward, deepcopy(next_state), done))
+        # stored_action = (action.detach() if isinstance(action, torch.Tensor)
+        #                  else action)
+        # self.buffer.append((state, stored_action, reward, deepcopy(next_state), done))
+        self.buffer.append(state)
 
     def sample(self, batch_size: int):
         """
@@ -111,15 +123,29 @@ class ReplayBuffer:
         all moved to self.device.
         """
         batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
+        # states, actions, rewards, next_states, dones = zip(*batch)
+        #
+        # states = deepcopy(states)
+        # next_states = deepcopy(next_states)
+        #
+        # return states, actions, rewards, next_states, dones
 
-        states = deepcopy(states)
-        # actions = actions.to(self.device)
-        # rewards = rewards
-        next_states = deepcopy(next_states)
-        # dones = dones
+        return batch
 
-        return states, actions, rewards, next_states, dones
+    def save_to_disk(self, path: str | Path, compress: Optional[str] = None) -> None:
+        path = path if isinstance(path, Path) else Path(path)
+        with open_binary(path, 'wb', compress=compress) as f:
+            pickle.dump((self.buffer.maxlen, list(self.buffer)), f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        print(f"Buffer snapshot saved at {path}")
+
+    def load_from_disk(self, path: str | Path, compress: Optional[str] = None) -> None:
+        path = path if isinstance(path, Path) else Path(path)
+        with open_binary(path, 'rb', compress) as f:
+            maxlen, data = pickle.load(f)
+        self.buffer = deque(data, maxlen=maxlen)
+
+        print(f"Buffer snapshot loaded from {path}")
 
     def __len__(self):
         return len(self.buffer)
@@ -127,7 +153,8 @@ class ReplayBuffer:
 
 class AlphaRouterAgent(nn.Module):
     """The AlphaRouter routing agent"""
-    def __init__(self, env: Routing, device: Device, embedding_dim: int = 20, num_heads: int = 6, ffn_dim: int = 64,
+    def __init__(self, connection_graph: nx.Graph, interaction_generator: InteractionGenerator | None = None,
+                 device: Device = torch.device("cpu"), embedding_dim: int = 20, num_heads: int = 6, ffn_dim: int = 64,
                  num_layers: int = 4, lookahead_length: int = 48, buffer_size: int = int(1e6), episode_limit: int = 150,
                  loss_coefficient: float = 0.0005, *args, **kwargs):
         """
@@ -143,8 +170,8 @@ class AlphaRouterAgent(nn.Module):
         print('Init')
         super().__init__(*args, **kwargs)
         self.device = device
-        self.env = env
-        self.env.rewarder = ManhattanRewarder()
+        self.env = make_env(connection_graph, interaction_generator)
+        # self.env.rewarder = ManhattanRewarder()
         # self.env.rewarder = GridManhattanRewarder(5)
         self.reward = 0
         self.episode_limit = episode_limit  # The maximal number of steps in a single episode
@@ -152,8 +179,8 @@ class AlphaRouterAgent(nn.Module):
         self.loss_sum = 0
         self.lookahead_length = lookahead_length
         self.embedding_dim = embedding_dim
-        state: RoutingState = self.env._state
-        connection_graph = state.connection_graph
+        # state: RoutingState = self.env._state
+        # connection_graph = state.connection_graph
         self.qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(),
                                             embedding_dim=embedding_dim).to(self.device)
         self.loss_coefficient = loss_coefficient
@@ -179,9 +206,9 @@ class AlphaRouterAgent(nn.Module):
         self.to(self.device)
 
         self.scaler = GradScaler(device=self.device.type)
-        self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()), lr=5e-5, weight_decay=1e-4)
-
-        env_fns = [make_env(connection_graph) for _ in range(N_ENVS)]
+        self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()),
+                                          lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        env_fns = [make_env(connection_graph, interaction_generator) for _ in range(N_ENVS)]
         self.vec_env = SyncVectorEnv(env_fns)
 
         print('Init successful')
@@ -320,8 +347,6 @@ class AlphaRouterAgent(nn.Module):
                 if done_list[i]:
                     continue
                 if done[i]:
-                    print("DONE KURWA DONE")
-                    print(f'DONE STATE mapping: {self.vec_env.envs[0]._state.mapping}')
                     done_list[i] = True
                     swaps[i] = step_idx
                     self.success_count += 1
@@ -369,13 +394,13 @@ class AlphaRouterAgent(nn.Module):
         if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
             mcts_input = self.replay_buffer.sample(MCTS_PROCESSES)
             # print(f'mcts_input: {mcts_input}')
-            mcts_actions, mcts_state_evals = self.mcts.run_parallel(mcts_input[0])
+            mcts_actions, mcts_state_evals = self.mcts.run_parallel(mcts_input)
             # print(f'mcts_action: {mcts_actions}')
             # print(f'mcts_state_evals: {mcts_state_evals}')
 
             embeddings = torch.stack(
                 [embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
-                             self.embedding_dim, self.padding_dim) for state in mcts_input[0]],
+                             self.embedding_dim, self.padding_dim) for state in mcts_input],
                 dim=0
             ).to(self.device)
 
@@ -391,6 +416,11 @@ class AlphaRouterAgent(nn.Module):
             print(f'### loss: {loss}')
             mean_loss = loss.mean()
             print(f'### mean_loss: {mean_loss}')
+
+            for state, transformer_action, mcts_action in zip(mcts_input, transformer_actions, mcts_actions):
+                print(f'### state: {state}')
+                print(f'### transformer_action: {transformer_action}')
+                print(f'### mcts_action: {mcts_action}')
 
             # self.scaler.scale(mean_loss).backward()
             # self.scaler.step(self.optimizer)
@@ -410,7 +440,17 @@ class AlphaRouterAgent(nn.Module):
             l2 = l2.detach().cpu()
         return loss, swaps, transformer_all_log_probs, l1, l2
 
+    def save_snapshot(self, idx):
+        path = TEMP_MODEL_DIR.joinpath(f"model_temp_{idx}.pt")
+        torch.save(self.state_dict(), path)
 
+        print(f"Model snapshot saved at {path}")
+
+        # buffer_path = TEMP_BUFFER_DIR.joinpath(f"buffer_{idx}.pt")
+        # self.replay_buffer.save_to_disk(buffer_path)
+
+    # def _has_passed_recurring_threshold(total_iterations, iteration, number_of_thresholds):
+    #     return (iteration * number_of_thresholds / total_iterations)
 
     def learn(self, total_timesteps: int, ma_window: int = 50, batch: bool = True) -> None:
         """
@@ -433,6 +473,7 @@ class AlphaRouterAgent(nn.Module):
         returns = []
         losses_l1 = []
         losses_l2 = []
+        snapshot = 0
 
         if not batch:
             for i in range(int(total_timesteps)):
@@ -440,6 +481,10 @@ class AlphaRouterAgent(nn.Module):
                 loss, swap, ep_return = self.episode()
                 swaps.append(swap)
                 returns.append(ep_return)
+
+                if i != 0 and i % 512 == 0:
+                    self.save_snapshot(snapshot)
+                    snapshot += 1
         else:
             for i in range(int(total_timesteps // N_ENVS)):
                 print(f"Episode: {i * N_ENVS}...")
@@ -449,6 +494,10 @@ class AlphaRouterAgent(nn.Module):
                 losses_l1.extend(l1)
                 losses_l2.extend(l2)
                 returns.extend(ep_return.detach().cpu())
+
+                if i != 0 and (i * N_ENVS) % 512 == 0:
+                    self.save_snapshot(snapshot)
+                    snapshot += 1
 
         self.mcts.close_workers()
 
@@ -460,6 +509,20 @@ class AlphaRouterAgent(nn.Module):
 
         print(f"Success count: {self.success_count}")
         print(f"Success %: {self.success_count / total_timesteps * 100}")
+
+        path = Path(LOG_DIR.joinpath(get_timestamp() + '.txt'))
+        with path.open('w', encoding='utf-8') as f:
+            f.write(f'episodes: {total_timesteps}\n')
+            f.write(f'learning rate: {LEARNING_RATE}\n')
+            f.write(f'weight decay: {WEIGHT_DECAY}\n')
+            f.write(f'N_ENVS: {N_ENVS}\n')
+            f.write(f'N_MCTS_WORKERS: {len(self.mcts.workers)}\n')
+            f.write(f'ma_swaps: {ma_swaps}\n')
+            f.write(f'ma_loss: {ma_loss}\n')
+            f.write(f'ma_loss_l1: {ma_loss_l1}\n')
+            f.write(f'ma_loss_l2: {ma_loss_l2}\n')
+            f.write(f"Success count: {self.success_count}\n")
+            f.write(f"Success %: {self.success_count / total_timesteps * 100}\n")
 
         episodes = range(1, total_timesteps + 1)
         mcts_games = range(1, len(losses) + 1)
@@ -475,14 +538,19 @@ class AlphaRouterAgent(nn.Module):
         plot(mcts_games, ma_loss_l2, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title='Loss L2 per MCTS games 50-Episode MA')
         # plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
 
-    def forward(self, env: Routing):
+    def forward(self, env: Routing, plot: bool = False):
         state: RoutingState = env._state
 
         assert len(state.connection_graph.edges) == self.action_space_size
 
         actions = []
 
+        # print(f'mappping: {env._state.mapping}')
+        # print(f'interaction circuit: {env._state.interaction_circuit}')
+
         for i in range(self.episode_limit):
+            if plot:
+                plot_mapping_and_circuit(env._state.connection_graph, env._state.mapping, env._state.interaction_circuit)
             node_embedding = embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
                         self.embedding_dim, self.padding_dim)
             node_embedding = node_embedding.unsqueeze(0)  # now shape (1, T, E)
@@ -491,8 +559,16 @@ class AlphaRouterAgent(nn.Module):
             observation, reward, done, truncated, info = env.step(transformer_action)
             actions.append(transformer_action)
 
-            if bool(observation['is_legal_surpass'][0]):
+            # print(f'mapping: {env._state.mapping}')
+            # print(f'env._state.interaction_circuit[env._state.position]: {env._state.interaction_circuit[env._state.position]}')
+            # print(f'is_legal_surpass: {env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position])}')
+
+            if env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position]):
                 observation, reward, done, truncated, info = env.step(self.action_space_size)
+                if plot:
+                    plot_mapping_and_circuit(env._state.connection_graph, env._state.mapping,
+                                         env._state.interaction_circuit)
+                # print('gate ahead, cap\'n!')
 
             if done:
                 return actions
@@ -518,17 +594,6 @@ if __name__ == '__main__':
     nx.draw(connection_graph, with_labels=True)
     plt.show()
 
-    # env = InitialMapping(connection_graph=connection_graph, graph_generator=BasicGraphGenerator(0.6), render_mode="human")
-    env = Routing(
-        max_observation_reach=LOOKAHEAD_LENGTH,
-        observe_legal_surpasses=True,
-        observe_connection_graph=True,
-        connection_graph=connection_graph,
-        render_mode="rgb_array",
-        rewarder=None,
-        interaction_generator=CustomInteractionGenerator()
-    )
-
     print(f"cuda version: {torch.version.cuda}")  # e.g. "11.8"
     print(f"cuda availability: {torch.cuda.is_available()}")
     print(f"device count: {torch.cuda.device_count()}")  # number of GPUs
@@ -536,10 +601,19 @@ if __name__ == '__main__':
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device("cpu")
     print(f"device: {device}")
-    model = AlphaRouterAgent(env, device, episode_limit=250).to(device)
+    path = MODEL_DIR.joinpath("model_1028_all_gates_13-11_patched_qgym_paper_hyper_2.pt")
+    print(path)
+
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
+                             device=device, episode_limit=250).to(device)
+    # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=None,
+    #                          device=device, episode_limit=250).to(device)
+    # model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
+
+    print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(1024, batch=True)
+    model.learn(64, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
@@ -559,24 +633,30 @@ if __name__ == '__main__':
     #
     # print('Successful inference')
 
-    path = MODEL_DIR.joinpath("model_C.pt")
-    print(path)
-
     torch.save(model.state_dict(), path)
-    print(f"Model saved: {model.state_dict()}")
-
+    # print(f"Model saved: {model.state_dict()}")
     print('Model saved successfully')
 
-    inference_model = AlphaRouterAgent(env, device, episode_limit=400).to(device)
+    env = Routing(
+        max_observation_reach=LOOKAHEAD_LENGTH,
+        observe_legal_surpasses=True,
+        observe_connection_graph=True,
+        connection_graph=connection_graph,
+        render_mode="rgb_array",
+        rewarder=None,
+        interaction_generator=CustomInteractionGenerator()
+    )
+
+    inference_model = AlphaRouterAgent(connection_graph=connection_graph, device=device, episode_limit=400).to(device)
     inference_model.load_state_dict(torch.load(path, weights_only=True))
     inference_model.eval()
     # inference_model.train()
     print('Model loaded successfully')
-    print(f"Model loaded: {inference_model.state_dict()}")
+    # print(f"Model loaded: {inference_model.state_dict()}")
 
-    for i in range(10):
+    for i in range(1):
         env.reset()
-        actions = inference_model(env)
+        actions = inference_model(env, plot=True)
         print('### ### ###')
         print(f'len(actions): {len(actions)}')
         print(f'actions: {actions}')
