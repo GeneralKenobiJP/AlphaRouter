@@ -39,15 +39,19 @@ EMBEDDING_DIM = 20      # AR paper embedding dimension
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length
 NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
+# FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
 FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
-N_ENVS: int = 64
-MCTS_PROCESSES: int = 10
+N_ENVS: int = 32
+MCTS_PROCESSES: int = 8
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 LEARNING_RATE = 1e-1
 WEIGHT_DECAY = 1e-4
+LR_DECAY_STEP = N_ENVS * 2
+LR_DECAY = 0.8
+MAX_GRAD_NORM = 5
 
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
@@ -208,6 +212,9 @@ class AlphaRouterAgent(nn.Module):
         self.scaler = GradScaler(device=self.device.type)
         self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()),
                                           lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=LR_DECAY_STEP,
+                                                         gamma=LR_DECAY)
+
         env_fns = [make_env(connection_graph, interaction_generator) for _ in range(N_ENVS)]
         self.vec_env = SyncVectorEnv(env_fns)
 
@@ -426,6 +433,7 @@ class AlphaRouterAgent(nn.Module):
             # self.scaler.step(self.optimizer)
             # self.scaler.update()
             mean_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.parameters(), MAX_GRAD_NORM)
             self.optimizer.step()
 
         # Return undiscounted returns per env for plotting and analysis
@@ -515,6 +523,9 @@ class AlphaRouterAgent(nn.Module):
             f.write(f'episodes: {total_timesteps}\n')
             f.write(f'learning rate: {LEARNING_RATE}\n')
             f.write(f'weight decay: {WEIGHT_DECAY}\n')
+            f.write(f'lr_decay: {LR_DECAY}\n')
+            f.write(f'lr_decay_step: {LR_DECAY_STEP}\n')
+            f.write(f'max_grad_norm: {MAX_GRAD_NORM}')
             f.write(f'N_ENVS: {N_ENVS}\n')
             f.write(f'N_MCTS_WORKERS: {len(self.mcts.workers)}\n')
             f.write(f'ma_swaps: {ma_swaps}\n')
@@ -551,6 +562,7 @@ class AlphaRouterAgent(nn.Module):
         for i in range(self.episode_limit):
             if plot:
                 plot_mapping_and_circuit(env._state.connection_graph, env._state.mapping, env._state.interaction_circuit)
+                time.sleep(0.1)
             node_embedding = embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
                         self.embedding_dim, self.padding_dim)
             node_embedding = node_embedding.unsqueeze(0)  # now shape (1, T, E)
@@ -613,7 +625,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(64, batch=True)
+    model.learn(512, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
@@ -656,7 +668,7 @@ if __name__ == '__main__':
 
     for i in range(1):
         env.reset()
-        actions = inference_model(env, plot=True)
+        actions = inference_model(env, plot=False)
         print('### ### ###')
         print(f'len(actions): {len(actions)}')
         print(f'actions: {actions}')
