@@ -1,6 +1,11 @@
+import bz2
+import datetime
+import gzip
+import lzma
 from collections import deque
+from pathlib import Path
 from sys import platform
-from typing import List, Set
+from typing import List, Set, Optional
 
 import numpy as np
 import torch
@@ -245,28 +250,29 @@ def compare_routing_states(state1: RoutingState, state2: RoutingState) -> bool:
 
     return True
 
-# def compare_routing_states(state1: RoutingState, state2: RoutingState) -> bool:
-#     if not (isinstance(state1, RoutingState) and isinstance(state2, RoutingState)):
-#         return False
-#     if not state1.connection_graph.number_of_nodes() == state2.connection_graph.number_of_nodes():
-#         return False
-#     if not state1.n_connections == state2.n_connections:
-#         return False
-#     if not state1.n_qubits == state2.n_qubits:
-#         return False
-#     edges1 = set(state1.connection_graph.edges)
-#     edges2 = set(state2.connection_graph.edges)
-#     if not edges1 == edges2:
-#         return False
-#     if not np.array_equal(state1.interaction_circuit, state2.interaction_circuit):
-#         return False
-#     if not state1.swap_gates_inserted == state2.swap_gates_inserted:
-#         return False
-#     if not np.array_equal(state1.mapping, state2.mapping):
-#         return False
-#     if not state1.position == state2.position:
-#         return False
-#     if not state1.steps_done == state2.steps_done:
-#         return False
-#
-#     return True
+def surpass_gate_if_possible(state: RoutingState):
+    if state.is_done():
+        return False
+
+    if state.is_legal_surpass(*state.interaction_circuit[state.position]):
+        state.update_state(state.n_connections)
+
+        return True
+    return False
+
+def surpass_all_possible_gates(state: RoutingState):
+    while surpass_gate_if_possible(state):
+        pass
+
+def open_binary(path: Path, mode: str = 'rb', compress: Optional[str] = None):
+    p = str(path)
+    if compress == 'gzip' or (compress == 'auto' and p.endswith('.gz')):
+        return gzip.open(p, mode)
+    if compress == 'bz2'  or (compress == 'auto' and p.endswith('.bz2')):
+        return bz2.open(p, mode)
+    if compress == 'lzma' or (compress == 'auto' and (p.endswith('.xz') or p.endswith('.lzma'))):
+        return lzma.open(p, mode)
+    return open(p, mode)
+
+def get_timestamp():
+    return str(datetime.datetime.now().isoformat()).replace(':', '-')

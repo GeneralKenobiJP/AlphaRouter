@@ -11,6 +11,9 @@ initial_mapping_3.zip
 pres.py
 routing_1.zip
 /COMPLETED_routing.ipynb
+/logs
+/models
+/plots
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
