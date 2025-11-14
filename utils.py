@@ -1,6 +1,11 @@
+import bz2
+import datetime
+import gzip
+import lzma
 from collections import deque
+from pathlib import Path
 from sys import platform
-from typing import List, Set
+from typing import List, Set, Optional
 
 import numpy as np
 import torch
@@ -258,4 +263,16 @@ def surpass_gate_if_possible(state: RoutingState):
 def surpass_all_possible_gates(state: RoutingState):
     while surpass_gate_if_possible(state):
         pass
-    
+
+def open_binary(path: Path, mode: str = 'rb', compress: Optional[str] = None):
+    p = str(path)
+    if compress == 'gzip' or (compress == 'auto' and p.endswith('.gz')):
+        return gzip.open(p, mode)
+    if compress == 'bz2'  or (compress == 'auto' and p.endswith('.bz2')):
+        return bz2.open(p, mode)
+    if compress == 'lzma' or (compress == 'auto' and (p.endswith('.xz') or p.endswith('.lzma'))):
+        return lzma.open(p, mode)
+    return open(p, mode)
+
+def get_timestamp():
+    return str(datetime.datetime.now().isoformat()).replace(':', '-')
