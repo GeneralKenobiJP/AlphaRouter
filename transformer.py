@@ -118,6 +118,8 @@ class Transformer(nn.Module):
         # Linear decoder that outputs the matrix of shape (number_of_logical_gates x number_of_swap_options)
         self.decoder = nn.Linear(d_model, swap_options)
 
+        self.value_head = nn.Linear(swap_options, 1)
+
     def forward(self, x):
         """
         Pads the input accordingly, applies the transformer encoder and linear decoder
@@ -132,4 +134,8 @@ class Transformer(nn.Module):
             x = layer(x)
         output = self.decoder(x)
         # print(f'shape: {output.shape}')
-        return choose_action(output)
+        state_values = self.value_head(output)
+        state_values = state_values.squeeze(-1)
+        state_values = state_values.mean(dim=1)
+
+        return *choose_action(output), state_values

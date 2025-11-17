@@ -3,6 +3,8 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
+
+import numpy as np
 import torch.multiprocessing as mp
 from torch.multiprocessing import Process
 from queue import Queue
@@ -514,13 +516,13 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
         embeddings = [t for _, t in awaiting_states]
         embedding = torch.stack(embeddings, dim=0)
         # actions, log_probs = get_action(embedding, transformer, device)
-        actions, _, swap_scores, _ = transformer(embedding)
+        actions, _, _, _, state_values = transformer(embedding)
 
         for idx, (idx_sender, _) in enumerate(awaiting_states):
             if output_queues_states[idx_sender] is False:
                 output_queues_states[idx_sender] = True
                 running_processes_num += 1
-            output_queues[idx_sender].put((detach(actions[idx].cpu()), detach(swap_scores[idx][actions[idx]].cpu())))
+            output_queues[idx_sender].put((detach(actions[idx].cpu()), detach(state_values[idx].cpu())))
 
         awaiting_states.clear()
 
@@ -626,7 +628,7 @@ class ParallelMCTS:
             queue_loop.join()
 
         actions = [a for a, _ in evaluated_roots]
-        state_values = [v for _, v in evaluated_roots]
+        state_values = [np.mean(v) for _, v in evaluated_roots]
 
         return actions, state_values
 

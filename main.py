@@ -43,7 +43,7 @@ NUM_LAYERS = 4          # AR paper number of transformer layers
 D_MODEL = 216
 FFN_DIM = 4 * D_MODEL            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 8
+MCTS_PROCESSES: int = 5
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
@@ -344,7 +344,7 @@ class AlphaRouterAgent(nn.Module):
         for step_idx in range(self.episode_limit):
             old_states = [deepcopy(cur_env._state) for cur_env in self.vec_env.envs]
 
-            actions, _, _, _ = self.transformer(state_embeddings)
+            actions, _, _, _, _ = self.transformer(state_embeddings)
 
             observations, rewards, terminated, truncated, info = self.vec_env.step(actions)
             done = np.logical_or(terminated, truncated)
@@ -415,12 +415,12 @@ class AlphaRouterAgent(nn.Module):
             ).to(self.device)
 
             # transformer_actions, transformer_log_probs, transformer_state_evals = self.get_action(embeddings)
-            transformer_actions, _, transformer_state_evals, transformer_all_log_probs = self.transformer(embeddings)
+            transformer_actions, _, transformer_state_evals, transformer_all_log_probs, state_values = self.transformer(embeddings)
             # print(f'transformer_log_probs: {transformer_all_log_probs}')
             l1 = torch.stack([-batch_log_probs[idx] for batch_log_probs, idx in zip(transformer_all_log_probs, mcts_actions)])
             print(f'### l1: {l1}')
             mcts_state_evals = torch.tensor(mcts_state_evals, dtype=transformer_all_log_probs.dtype, device=transformer_all_log_probs.device)
-            l2 = ((transformer_all_log_probs - mcts_state_evals)**2).sum(dim=1)
+            l2 = (state_values - mcts_state_evals).pow(2)
             print(f'### l2: {l2}')
             loss = (l1 + self.loss_coefficient * l2) / self.action_space_size
             print(f'### loss: {loss}')
@@ -569,7 +569,7 @@ class AlphaRouterAgent(nn.Module):
             node_embedding = embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
                         self.embedding_dim, self.padding_dim)
             node_embedding = node_embedding.unsqueeze(0)  # now shape (1, T, E)
-            transformer_action, _, _, _ = self.transformer(node_embedding)
+            transformer_action, _, _, _, _ = self.transformer(node_embedding)
 
             observation, reward, done, truncated, info = env.step(transformer_action)
             actions.append(transformer_action)
