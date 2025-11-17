@@ -96,7 +96,7 @@ class Transformer(nn.Module):
     """
     Complete transformer encoder used in the agent with linear decoder
     """
-    def __init__(self, embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length, swap_options):
+    def __init__(self, embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length, swap_options):
         """
         :param embedding_dim: Embedding dimension of the node embeddings (with the padding and depth)
         :param num_heads: Number of heads in a multihead attention layer
@@ -107,14 +107,16 @@ class Transformer(nn.Module):
         """
         super().__init__()
 
-        self.positional_encoding = PositionalEncoding(embedding_dim, lookahead_length)
+        self.input_projection = nn.Linear(embedding_dim, d_model)
+
+        self.positional_encoding = PositionalEncoding(d_model, lookahead_length)
 
         self.layers = nn.ModuleList([
-            TransformerLayer(embedding_dim, num_heads, ffn_dim) for _ in range(num_layers)
+            TransformerLayer(d_model, num_heads, ffn_dim) for _ in range(num_layers)
         ])
 
         # Linear decoder that outputs the matrix of shape (number_of_logical_gates x number_of_swap_options)
-        self.decoder = nn.Linear(embedding_dim, swap_options)
+        self.decoder = nn.Linear(d_model, swap_options)
 
     def forward(self, x):
         """
@@ -122,9 +124,12 @@ class Transformer(nn.Module):
         :param x: input tensor
         """
         # with autocast(self.device.type):
+        x = self.input_projection(x)
+
         x = self.positional_encoding(x)
 
         for layer in self.layers:
             x = layer(x)
         output = self.decoder(x)
+        # print(f'shape: {output.shape}')
         return choose_action(output)

@@ -40,8 +40,9 @@ LOOKAHEAD_LENGTH = 48   # AR paper lookahead length
 NUM_HEADS = 6           # AR paper number of heads in multihead attention
 NUM_LAYERS = 4          # AR paper number of transformer layers
 # FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
-FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
-N_ENVS: int = 32
+D_MODEL = 216
+FFN_DIM = 4 * D_MODEL            # Default hidden layer dimensionality of ffn in transformer
+N_ENVS: int = 64
 MCTS_PROCESSES: int = 8
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
@@ -158,7 +159,7 @@ class ReplayBuffer:
 class AlphaRouterAgent(nn.Module):
     """The AlphaRouter routing agent"""
     def __init__(self, connection_graph: nx.Graph, interaction_generator: InteractionGenerator | None = None,
-                 device: Device = torch.device("cpu"), embedding_dim: int = 20, num_heads: int = 6, ffn_dim: int = 64,
+                 device: Device = torch.device("cpu"), embedding_dim: int = 20, num_heads: int = 6, d_model: int = D_MODEL, ffn_dim: int = FFN_DIM,
                  num_layers: int = 4, lookahead_length: int = 48, buffer_size: int = int(1e6), episode_limit: int = 150,
                  loss_coefficient: float = 0.0005, *args, **kwargs):
         """
@@ -200,7 +201,7 @@ class AlphaRouterAgent(nn.Module):
         else:
             self.padding_dim = 0
 
-        self.transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead_length, swap_options=self.action_space_size).to(self.device)
+        self.transformer = Transformer(embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length, swap_options=self.action_space_size).to(self.device)
         self.replay_buffer = ReplayBuffer(
             buffer_size,
             self.device
@@ -334,6 +335,8 @@ class AlphaRouterAgent(nn.Module):
                               self.embedding_dim, self.padding_dim) for cur_env in self.vec_env.envs],
             dim=0
         ).to(self.device)
+
+        # assert state_embeddings.shape[1] is LOOKAHEAD_LENGTH
 
         done_list = [False] * N_ENVS
         swaps = [self.episode_limit] * N_ENVS
@@ -616,10 +619,10 @@ if __name__ == '__main__':
     path = MODEL_DIR.joinpath("model_1028_all_gates_13-11_patched_qgym_paper_hyper_2.pt")
     print(path)
 
-    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
-                             device=device, episode_limit=250).to(device)
-    # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=None,
+    # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
     #                          device=device, episode_limit=250).to(device)
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=None,
+                             device=device, episode_limit=150).to(device)
     # model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
 
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
