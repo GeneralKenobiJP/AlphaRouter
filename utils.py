@@ -109,8 +109,8 @@ def embed_nodes(state: RoutingState, lookahead_length: int, device: Device, qubi
 
         feature_matrix.append(gate_vector)
 
-    if len(feature_matrix) == 0:
-        return torch.zeros((lookahead_length, embedding_dim), device=device)
+    while len(feature_matrix) < lookahead_length:
+        feature_matrix.append(torch.zeros(embedding_dim + padding_dim + 1, device=device))
 
     return torch.stack(feature_matrix)
 
