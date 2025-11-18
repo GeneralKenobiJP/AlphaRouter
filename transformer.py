@@ -17,15 +17,23 @@ class PositionalEncoding(nn.Module):
         """
         super().__init__()
 
-        position = torch.arange(lookahead_length, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, embedding_dim, 2, dtype=torch.float32) * (-math.log(1e5) / embedding_dim))
+        position = torch.arange(lookahead_length, dtype=torch.float32).unsqueeze(1)  # (T,1)
+        div_term = torch.exp(
+            torch.arange(0, embedding_dim, 2, dtype=torch.float32) * (-math.log(1e5) / embedding_dim))  # (d/2,)
         pe = torch.zeros(lookahead_length, embedding_dim)
         pe[:, 0::2] = torch.sin(position * div_term)
-
-        # Rounded up to the nearest even number so that odd indices slicing works
-        final_embedding_dim_even = embedding_dim if embedding_dim % 2 == 0 else embedding_dim - 1
-        pe[:, 1::2] = torch.cos(position * div_term[::final_embedding_dim_even])
+        pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
+
+        # position = torch.arange(lookahead_length, dtype=torch.float32).unsqueeze(1)
+        # div_term = torch.exp(torch.arange(0, embedding_dim, 2, dtype=torch.float32) * (-math.log(1e5) / embedding_dim))
+        # pe = torch.zeros(lookahead_length, embedding_dim)
+        # pe[:, 0::2] = torch.sin(position * div_term)
+        #
+        # # Rounded up to the nearest even number so that odd indices slicing works
+        # final_embedding_dim_even = embedding_dim if embedding_dim % 2 == 0 else embedding_dim - 1
+        # pe[:, 1::2] = torch.cos(position * div_term[::final_embedding_dim_even])
+        # self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -118,7 +126,7 @@ class Transformer(nn.Module):
         # Linear decoder that outputs the matrix of shape (number_of_logical_gates x number_of_swap_options)
         self.decoder = nn.Linear(d_model, swap_options)
 
-        self.value_head = nn.Linear(swap_options, 1)
+        self.value_head = nn.Linear(d_model, 1)
 
     def forward(self, x):
         """
@@ -134,7 +142,7 @@ class Transformer(nn.Module):
             x = layer(x)
         output = self.decoder(x)
         # print(f'shape: {output.shape}')
-        state_values = self.value_head(output)
+        state_values = self.value_head(x)
         state_values = state_values.squeeze(-1)
         state_values = state_values.mean(dim=1)
 

@@ -161,7 +161,7 @@ class AlphaRouterAgent(nn.Module):
     def __init__(self, connection_graph: nx.Graph, interaction_generator: InteractionGenerator | None = None,
                  device: Device = torch.device("cpu"), embedding_dim: int = 20, num_heads: int = 6, d_model: int = D_MODEL, ffn_dim: int = FFN_DIM,
                  num_layers: int = 4, lookahead_length: int = 48, buffer_size: int = int(1e6), episode_limit: int = 150,
-                 loss_coefficient: float = 0.0005, *args, **kwargs):
+                 loss_coefficient: float = 0.00005, *args, **kwargs):
         """
         :param env: Particular routing environment we want to apply the agent to
         :param device: Device to run the agent on (cuda for Nvidia graphics card, cpu for a standard cpu)
@@ -349,8 +349,16 @@ class AlphaRouterAgent(nn.Module):
             observations, rewards, terminated, truncated, info = self.vec_env.step(actions)
             done = np.logical_or(terminated, truncated)
 
-            observations, rewards, terminated, truncated, info = self.vec_env.step(np.full((N_ENVS,), self.action_space_size))
-            done = np.logical_or(terminated, truncated, done)
+            for i in range(N_ENVS):
+                if done_list[i] or done[i]:
+                    continue
+                env = self.vec_env.envs[i]
+                if env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position]):
+                    obs, rew, ter, trun, inf = env.step(self.action_space_size)
+                    done[i] = ter or trun or done[i]
+
+            # observations, rewards, terminated, truncated, info = self.vec_env.step(np.full((N_ENVS,), self.action_space_size))
+            # done = np.logical_or(terminated, truncated, done)
 
             for i in range(N_ENVS):
                 # print(self.vec_env.envs[0]._state)
@@ -628,7 +636,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(512, batch=True)
+    model.learn(1028, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
