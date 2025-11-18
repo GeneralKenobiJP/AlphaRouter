@@ -201,7 +201,7 @@ class AlphaRouterAgent(nn.Module):
         else:
             self.padding_dim = 0
 
-        self.transformer = Transformer(embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length, swap_options=self.action_space_size).to(self.device)
+        self.transformer = Transformer(embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length, swap_options=self.action_space_size, device=self.device).to(self.device)
         self.replay_buffer = ReplayBuffer(
             buffer_size,
             self.device

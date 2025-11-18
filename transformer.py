@@ -104,7 +104,7 @@ class Transformer(nn.Module):
     """
     Complete transformer encoder used in the agent with linear decoder
     """
-    def __init__(self, embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length, swap_options):
+    def __init__(self, embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length, swap_options, device):
         """
         :param embedding_dim: Embedding dimension of the node embeddings (with the padding and depth)
         :param num_heads: Number of heads in a multihead attention layer
@@ -114,6 +114,8 @@ class Transformer(nn.Module):
         :param swap_options: Number of possible swaps actions + 1 (to include no swap)
         """
         super().__init__()
+
+        self.device = device
 
         self.input_projection = nn.Linear(embedding_dim, d_model)
 

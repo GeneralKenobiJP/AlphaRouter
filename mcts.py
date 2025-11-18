@@ -353,7 +353,7 @@ class MCTSWorker:
 
     def simulate(self, node: Node) -> Tensor:
         state = node.state
-        embedding = detach(embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
+        embedding = detach(embed_nodes(state, self.lookahead_length, torch.device('cpu'), self.qubit_embedding,
                                         self.embedding_dim, self.padding_dim).cpu()).share_memory_()
 
         self.inference_queue.put((self.idx, embedding))
@@ -436,6 +436,7 @@ def run_worker(worker: MCTSWorker, inference_queue: mp.Queue, output_queue: mp.Q
     boost_process_priority()
 
     worker.set_queues(inference_queue, output_queue)
+    worker.qubit_embedding.to(torch.device('cpu'))
     try:
         # print(f'Root state: {root_state}')
         while True:
@@ -513,7 +514,7 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
                 if len(awaiting_states) > 0:
                     break
 
-        embeddings = [t for _, t in awaiting_states]
+        embeddings = [t.to(transformer.device) for _, t in awaiting_states]
         embedding = torch.stack(embeddings, dim=0)
         # actions, log_probs = get_action(embedding, transformer, device)
         actions, _, _, _, state_values = transformer(embedding)
@@ -583,7 +584,7 @@ class ParallelMCTS:
         self.signal_queues = [self.manager.Queue() for _ in range(self.processes)]
         self.result_queues = [self.manager.Queue() for _ in range(self.processes)]
         self.workers: List[MCTSWorker] = [
-            MCTSWorker(i, self.qubit_embedding, self.device, self.swap_options, self.c_constant,
+            MCTSWorker(i, self.qubit_embedding, torch.device('cpu'), self.swap_options, self.c_constant,
                        self.rollouts, self.lookahead_length, self.embedding_dim, self.padding_dim)
 
             for i in range(processes)
