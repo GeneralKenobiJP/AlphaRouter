@@ -104,7 +104,7 @@ class Transformer(nn.Module):
     """
     Complete transformer encoder used in the agent with linear decoder
     """
-    def __init__(self, embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length, swap_options, device):
+    def __init__(self, embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length, swap_options, device = torch.device("cpu")):
         """
         :param embedding_dim: Embedding dimension of the node embeddings (with the padding and depth)
         :param num_heads: Number of heads in a multihead attention layer

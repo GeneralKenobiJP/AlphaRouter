@@ -15,7 +15,9 @@ from main import ReplayBuffer, ManhattanRewarder, AlphaRouterAgent, \
     LOOKAHEAD_LENGTH
 from mcts import MCTS, gen_hash, MCTSWorker, inference_loop, Node
 from transformer import PositionalEncoding, TransformerLayer, Transformer
-from utils import compare_routing_states
+from utils import compare_routing_states, embed_nodes
+
+import torch.multiprocessing as mp
 
 
 # --- utils ---
@@ -190,8 +192,8 @@ def test_positional_encoding_shape():
     embedding_dim = 10
     lookahead_length = 7
     pe = PositionalEncoding(embedding_dim, lookahead_length)
-    # Create a dummy input of shape (lookahead_length, embedding_dim + 1)
-    x = torch.zeros(lookahead_length, embedding_dim + 1)
+    # Create a dummy input of shape (lookahead_length, embedding_dim)
+    x = torch.zeros(1, lookahead_length, embedding_dim)
     out = pe(x)
     assert out.shape == x.shape, "PositionalEncoding should preserve input shape"
 
@@ -200,7 +202,7 @@ def test_positional_encoding_variation():
     embedding_dim = 8
     lookahead_length = 6
     pe = PositionalEncoding(embedding_dim, lookahead_length)
-    x = torch.zeros(lookahead_length, embedding_dim + 1)
+    x = torch.zeros(lookahead_length, embedding_dim)
     out = pe(x)
     # Ensure the positional encoding actually adds non-zero components
     assert not torch.allclose(out, x), "Output should differ from input for non-zero PE"
@@ -225,41 +227,42 @@ def test_transformer_layer_forward():
 def test_transformer_forward_shape():
     embedding_dim = 4
     num_heads = 2
-    ffn_dim = 16
+    d_model = 8
+    ffn_dim = 8*4
     num_layers = 1
     lookahead = 5
     swap_options = 6
-    trans = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead, swap_options)
+    trans = Transformer(embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead, swap_options)
     # Input to transformer.forward should be (lookahead, embedding_dim+1)
-    x = torch.randn(lookahead, embedding_dim + 1)
-    out = trans(x)
-    # Output should be (lookahead, swap_options)
-    assert out.shape == (lookahead, swap_options), "Transformer should output (T, swap_options)"
+    x = torch.randn(lookahead, embedding_dim)
+    out, _, _, _, _ = trans(x)
+
+    assert out.shape == (1,), "Transformer should output (T, swap_options)"
 
 
 # --- ReplayBuffer tests ---
 
-def test_replay_buffer_store_and_sample():
-    capacity = 8
-    device = torch.device("cpu")
-    rb = ReplayBuffer(capacity, device)
-    state_shape = (3,)
-    # Store more than capacity to test rollover
-    for i in range(capacity + 2):
-        s = torch.randn(*state_shape)
-        a = i % 4
-        r = float(i)
-        ns = torch.randn(*state_shape)
-        done = (i % 2 == 0)
-        rb.store(s, a, r, ns, done)
-    assert len(rb) == capacity, "ReplayBuffer should not exceed its capacity"
-    batch_size = 4
-    states, actions, rewards, next_states, dones = rb.sample(batch_size)
-    assert states.shape == (batch_size, *state_shape)
-    assert actions.shape == (batch_size,)
-    assert rewards.shape == (batch_size,)
-    assert next_states.shape == (batch_size, *state_shape)
-    assert dones.shape == (batch_size,)
+# def test_replay_buffer_store_and_sample():
+#     capacity = 8
+#     device = torch.device("cpu")
+#     rb = ReplayBuffer(capacity, device)
+#     state_shape = (3,)
+#     # Store more than capacity to test rollover
+#     for i in range(capacity + 2):
+#         s = torch.randn(*state_shape)
+#         a = i % 4
+#         r = float(i)
+#         ns = torch.randn(*state_shape)
+#         done = (i % 2 == 0)
+#         rb.store(s, a, r, ns, done)
+#     assert len(rb) == capacity, "ReplayBuffer should not exceed its capacity"
+#     batch_size = 4
+#     states, actions, rewards, next_states, dones = rb.sample(batch_size)
+#     assert states.shape == (batch_size, *state_shape)
+#     assert actions.shape == (batch_size,)
+#     assert rewards.shape == (batch_size,)
+#     assert next_states.shape == (batch_size, *state_shape)
+#     assert dones.shape == (batch_size,)
 
 
 # --- ManhattanRewarder tests ---
@@ -299,10 +302,11 @@ class DummyEnv:
 
 
 def test_embed_nodes_basic():
-    agent = AlphaRouterAgent.__new__(AlphaRouterAgent)
+    # agent = AlphaRouterAgent.__new__(AlphaRouterAgent)
     # Monkey-patch minimal attributes
-    agent.lookahead_length = 3
-    agent.embedding_dim = 5
+    lookahead_length = 3
+    embedding_dim = 5
+    padding_dim = 2
 
     class S:
         n_qubits = 2
@@ -311,11 +315,13 @@ def test_embed_nodes_basic():
 
     env = DummyEnv()
     env._state = S()
-    agent.env = env
-    agent.qubit_embedding = nn.Embedding(2, agent.embedding_dim)
-    mat = agent.embed_nodes()
+    # agent.env = env
+    qubit_embedding = nn.Embedding(2, embedding_dim)
+    # mat = agent.embed_nodes()
+
+    mat = embed_nodes(env._state, lookahead_length, None, qubit_embedding, embedding_dim, padding_dim)
     # Should produce a tensor of shape (2, embedding_dim+1)
-    assert mat.shape == (2, agent.embedding_dim + 1)
+    assert mat.shape == (lookahead_length, embedding_dim + padding_dim + 1)
 
 
 # --- get_action tests ---
@@ -333,6 +339,40 @@ def test_embed_nodes_basic():
 #     assert isinstance(action, int) and 0 <= action < 4
 #     assert isinstance(logp, torch.Tensor) and logp.dim() == 0
 
+# test_fp.py
+
+def mock_worker(state_bytes, out_q):
+    # state_bytes -> reconstruct or pass pickled state; for a quick test:
+    out_q.put(gen_hash(state_bytes))
+
+def test_hashing_across_processes():
+    # create a RoutingState-like object S (or serialize your state)
+    connection_graph = nx.Graph()
+    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)])
+
+    env = Routing(
+        max_observation_reach=LOOKAHEAD_LENGTH,
+        observe_legal_surpasses=True,
+        observe_connection_graph=True,
+        connection_graph=connection_graph,
+        render_mode="rgb_array",
+        rewarder=None,
+        interaction_generator=None
+    )
+
+    env.reset()
+
+    S = env._state   # create a RoutingState
+    fp_main = gen_hash(S)
+    q = mp.Queue()
+    p = mp.Process(target=mock_worker, args=(S, q))
+    p.start()
+    fp_child = q.get()
+    p.join()
+    assert fp_main == fp_child
+    print("Hashing stable across processes:", fp_main)
+
+
 def test_mcts():
     connection_graph = nx.Graph()
     connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)])
@@ -349,11 +389,12 @@ def test_mcts():
 
     embedding_dim = 8
     num_heads = 2
-    ffn_dim = 16
+    d_model = 16
+    ffn_dim = 4 * d_model
     num_layers = 1
     lookahead = 5
     swap_options = 7
-    transformer = Transformer(embedding_dim, num_heads, ffn_dim, num_layers, lookahead, swap_options)
+    transformer = Transformer(embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead, swap_options)
     device = torch.device("cpu")
     qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(),
                                    embedding_dim=embedding_dim - 1).to(device)

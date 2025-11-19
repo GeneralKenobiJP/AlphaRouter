@@ -49,10 +49,11 @@ REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 LEARNING_RATE = 1e-1
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 0
 LR_DECAY_STEP = N_ENVS * 2
 LR_DECAY = 0.8
 MAX_GRAD_NORM = 5
+LOSS_COEFFICIENT = 0.1
 
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
@@ -536,7 +537,8 @@ class AlphaRouterAgent(nn.Module):
             f.write(f'weight decay: {WEIGHT_DECAY}\n')
             f.write(f'lr_decay: {LR_DECAY}\n')
             f.write(f'lr_decay_step: {LR_DECAY_STEP}\n')
-            f.write(f'max_grad_norm: {MAX_GRAD_NORM}')
+            f.write(f'loss_coefficient: {LOSS_COEFFICIENT}\n')
+            f.write(f'max_grad_norm: {MAX_GRAD_NORM}\n')
             f.write(f'N_ENVS: {N_ENVS}\n')
             f.write(f'N_MCTS_WORKERS: {len(self.mcts.workers)}\n')
             f.write(f'ma_swaps: {ma_swaps}\n')
@@ -621,16 +623,16 @@ if __name__ == '__main__':
     print(f"cuda availability: {torch.cuda.is_available()}")
     print(f"device count: {torch.cuda.device_count()}")  # number of GPUs
     print(f"devices: {torch.cuda.get_device_name}")
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
     print(f"device: {device}")
-    path = MODEL_DIR.joinpath("model_1028_all_gates_13-11_patched_qgym_paper_hyper_2.pt")
+    path = MODEL_DIR.joinpath(f"model_1028_far_gate_patched_qgym_paper_hyper_2-{get_timestamp()}.pt")
     print(path)
 
     # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
     #                          device=device, episode_limit=250).to(device)
-    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=None,
-                             device=device, episode_limit=150).to(device)
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
+                             device=device, episode_limit=150, loss_coefficient=LOSS_COEFFICIENT).to(device)
     # model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
 
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')

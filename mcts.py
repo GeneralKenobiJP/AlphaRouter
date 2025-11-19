@@ -1,3 +1,4 @@
+import hashlib
 import math
 import os
 import time
@@ -27,7 +28,13 @@ mp.set_start_method("spawn", force=True)
 
 
 def gen_hash(state: RoutingState):
-    return hash( (state.interaction_circuit.data.tobytes(), state.mapping.data.tobytes()) )
+    m = hashlib.sha256(usedforsecurity=False)
+    m.update(state.interaction_circuit.data.tobytes())
+    m.update(state.mapping.data.tobytes())
+    m.update(str(state.n_qubits).encode())
+    m.update(str(state.n_connections).encode())
+    return int(m.hexdigest(), 16)
+    # return hash( (state.interaction_circuit.data.tobytes(), state.mapping.data.tobytes()) )
 
 class Node:
     def __init__(self, state: RoutingState):
@@ -55,12 +62,12 @@ class Node:
     def __eq__(self, other):
         if not isinstance(other, Node):
             return False
-        if self.visits != other.visits:
-            return False
-        if not math.isclose(self.value, other.value):
-            return False
-        if not self.children == other.children:
-            return False
+        # if self.visits != other.visits:
+        #     return False
+        # if not math.isclose(self.value, other.value):
+        #     return False
+        # if not self.children == other.children:
+        #     return False
         return compare_routing_states(self.state, other.state)
 
     def __reduce__(self):
@@ -417,12 +424,10 @@ class MCTSWorker:
         if isinstance(best_action, Tensor):
             best_action = best_action.item()
 
-        node_list = list(self.root.children.keys())
-        state_evals = [0] * self.swap_options
-
-        for i in range(len(node_list)):
-            node: Node = node_list[i]
-            state_evals[i] = node.value
+        state_evals = [0.0] * self.swap_options
+        for child_node, action in self.root.children.items():  # child_node is Node, action is int or Tensor
+            act_idx = int(action.item()) if isinstance(action, torch.Tensor) else int(action)
+            state_evals[act_idx] = child_node.value
 
         return (best_action, state_evals), self.transposition_table
 
@@ -444,7 +449,7 @@ def run_worker(worker: MCTSWorker, inference_queue: mp.Queue, output_queue: mp.Q
             # print(f'signal received: {root_state}')
             if root_state is None:
                 return
-            if isinstance(root_state, Tuple) and root_state[0] is None:
+            if isinstance(root_state, tuple) and root_state[0] is None:
                 tree = root_state[1]
                 worker.update_tree(tree)
                 print(f'worker: {worker.idx} updates tree:')

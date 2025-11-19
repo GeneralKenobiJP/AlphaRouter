@@ -275,4 +275,4 @@ def open_binary(path: Path, mode: str = 'rb', compress: Optional[str] = None):
     return open(p, mode)
 
 def get_timestamp():
-    return str(datetime.datetime.now().isoformat()).replace(':', '-')
+    return str(datetime.datetime.now().isoformat()).replace(':', '-').replace('.', '-')
