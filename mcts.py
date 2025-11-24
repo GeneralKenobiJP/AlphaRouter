@@ -427,7 +427,7 @@ class MCTSWorker:
         state_evals = [0.0] * self.swap_options
         for child_node, action in self.root.children.items():  # child_node is Node, action is int or Tensor
             act_idx = int(action.item()) if isinstance(action, torch.Tensor) else int(action)
-            state_evals[act_idx] = child_node.value
+            state_evals[act_idx] = child_node.value / (child_node.visits + 1e-6)
 
         return (best_action, state_evals), self.transposition_table
 
