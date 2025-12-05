@@ -129,6 +129,10 @@ class Transformer(nn.Module):
         self.decoder = nn.Linear(d_model, swap_options)
 
         self.value_head = nn.Linear(d_model, 1)
+        self.value_head.bias.data.fill_(-5.0)
+        nn.init.uniform_(self.value_head.weight, -0.5, -1e-2)
+
+        # print(f'Transformer parameters initialised to {self.state_dict()}')
 
     def forward(self, x):
         """
