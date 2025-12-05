@@ -4,6 +4,7 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
+from pathlib import Path
 
 import numpy as np
 import torch.multiprocessing as mp
@@ -12,7 +13,7 @@ from queue import Queue
 from typing import Optional, List, Dict, Tuple
 
 import torch
-from qgym.envs.routing import RoutingState
+from qgym.envs.routing import RoutingState, BasicRewarder
 from torch import Tensor, nn, detach, NoneType
 from torch.amp import GradScaler, autocast
 from torch.nn import Embedding
@@ -20,16 +21,21 @@ from torch.types import Device
 from tqdm import tqdm
 
 from manhattan_rewarder import ManhattanRewarder
+from plotting import plot_mcts_tree
 from transformer import Transformer
 from utils import embed_nodes, compute_returns, boost_process_priority, compare_routing_states, \
     surpass_all_possible_gates
 
 mp.set_start_method("spawn", force=True)
 
+MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
+TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
+TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
+
 
 def gen_hash(state: RoutingState):
     m = hashlib.sha256(usedforsecurity=False)
-    m.update(state.interaction_circuit.data.tobytes())
+    m.update(state.interaction_circuit[0].data.tobytes())
     m.update(state.mapping.data.tobytes())
     m.update(str(state.n_qubits).encode())
     m.update(str(state.n_connections).encode())
@@ -261,7 +267,9 @@ class MCTSWorker:
         self.lookahead_length = lookahead_length
         self.embedding_dim = embedding_dim
         self.padding_dim = padding_dim
-        self.rewarder = ManhattanRewarder()
+        # self.rewarder = ManhattanRewarder()
+        # NOTE: the rewarder does not do anything at the moment
+        self.rewarder = BasicRewarder(illegal_action_penalty=0, penalty_per_swap=-1, reward_per_surpass=1)
         self.inference_queue: mp.Queue | None = None
         self.output_queue: mp.Queue | None = None
         self.idx = idx
@@ -306,7 +314,6 @@ class MCTSWorker:
                 path_actions.append(action)
             else:
                 return node, False, path_states, path_actions
-        node.value = len(node.state.interaction_circuit) - len(node.state.swap_gates_inserted) - 1
 
         return node, True, path_states, path_actions
 
@@ -362,18 +369,35 @@ class MCTSWorker:
         state = node.state
         embedding = detach(embed_nodes(state, self.lookahead_length, torch.device('cpu'), self.qubit_embedding,
                                         self.embedding_dim, self.padding_dim).cpu()).share_memory_()
+        # print(f'embedding before sending: {embedding}')
 
         self.inference_queue.put((self.idx, embedding))
         try:
             action, state_eval = self.output_queue.get()
+            # print(f'action received: {action}')
+            # print(f'state_eval received: {state_eval}')
         except:
             state_eval = None
 
         return state_eval
 
-    def backpropagate(self, path_states: list[RoutingState], path_actions: list[int], reward: Tensor):
+    def backpropagate(self, path_states: list[RoutingState], path_actions: list[int], reward: None | Tensor):
+        # print(f'path_states: {path_states}')
+        # print(f'path_actions: {path_actions}')
+        # print(f'reward in backprop: {reward}')
         path_states.reverse()
         path_actions.reverse()
+        if reward is None:
+            # Terminal node - the reward is known
+
+            # for i in range(0, len(path_states)-1):
+            #     reward += self.rewarder.compute_reward(old_state=path_states[i+1], action=path_actions[i], new_state=path_states[i])
+            #     if path_states[i-1].position != path_states[i].position:
+            #         reward += self.rewarder.compute_reward(old_state=path_states[i+1], action=self.swap_options,
+            #                                                new_state=path_states[i])
+            # reward = self.rewarder.compute_reward(old_state=path_states[-1], action=0, new_state=path_states[0])
+            reward = (path_states[0].position) - (len(path_actions) - 1) - 1
+
         for (state, action) in zip(path_states, path_actions):
             node = self.get_transposition(gen_hash(state))
             node.visits += 1
@@ -388,7 +412,7 @@ class MCTSWorker:
             self.add_child(self.get_transposition(gen_hash(path_states[-1])), path_actions[-1], root.state)
             return True
         if is_terminal:
-            self.backpropagate(path_states, path_actions, leaf_node.value)
+            self.backpropagate(path_states, path_actions, None)
             return False
 
         node, action = self.expand(leaf_node)
@@ -397,6 +421,7 @@ class MCTSWorker:
 
         reward = self.simulate(node)
         self.backpropagate(path_states, path_actions, reward)
+        # plot_mcts_tree(self.root, mcts=self, max_nodes=10, show=True)
 
         return False
 
@@ -420,14 +445,22 @@ class MCTSWorker:
         if len(self.root.children) == 0:
             return 0, 1, self.transposition_table
 
-        best_action = self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]
+        best_action = self.root.children[max(self.root.children.keys(), key=lambda child: child.value / (child.visits + 1e-6))]
         if isinstance(best_action, Tensor):
             best_action = best_action.item()
 
         state_evals = [0.0] * self.swap_options
+        # print(f'len self.root.children.items() = {len(self.root.children.items())}')
         for child_node, action in self.root.children.items():  # child_node is Node, action is int or Tensor
             act_idx = int(action.item()) if isinstance(action, torch.Tensor) else int(action)
+            # print(f'child node value: {child_node.value}')
             state_evals[act_idx] = child_node.value / (child_node.visits + 1e-6)
+
+        ###
+        # DEBUG
+        # print(f'state evals: {state_evals}')
+        plot_mcts_tree(self.root, mcts=self, max_nodes=10, show=True)
+        ###
 
         return (best_action, state_evals), self.transposition_table
 
@@ -499,6 +532,10 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
 
     boost_process_priority()
 
+    transformer = deepcopy(transformer)
+    transformer.load_state_dict(torch.load(TEMP_TRANSFORMER_DIR, weights_only=True, map_location=transformer.device))
+    # transformer.eval()
+
     while True:
         while len(awaiting_states) < running_processes_num or (running_processes_num == 0 and len(awaiting_states) == 0):
             try:
@@ -509,6 +546,9 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
                     return
                 if awaiting_states[-1][-1] is None:
                     idx = awaiting_states[-1][0]
+                    if not output_queues_states[idx]:
+                        awaiting_states.pop()
+                        continue
                     output_queues_states[idx] = False
                     running_processes_num -= 1
                     # output_queues[idx].close()
@@ -521,8 +561,12 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
 
         embeddings = [t.to(transformer.device) for _, t in awaiting_states]
         embedding = torch.stack(embeddings, dim=0)
+        # print(f'embeddings: {embeddings}')
+        # print(f'embedding: {embedding}')
         # actions, log_probs = get_action(embedding, transformer, device)
         actions, _, _, _, state_values = transformer(embedding)
+        # print(transformer.state_dict())
+        # print(f'inferred state value: {state_values}')
 
         for idx, (idx_sender, _) in enumerate(awaiting_states):
             if output_queues_states[idx_sender] is False:
