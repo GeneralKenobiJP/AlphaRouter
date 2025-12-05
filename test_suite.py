@@ -13,7 +13,7 @@ from torch import nn, Tensor, tensor
 from custom_interaction_generator import CustomInteractionGenerator
 from main import ReplayBuffer, ManhattanRewarder, AlphaRouterAgent, \
     LOOKAHEAD_LENGTH
-from mcts import MCTS, gen_hash, MCTSWorker, inference_loop, Node
+from mcts import MCTS, gen_hash, MCTSWorker, inference_loop, Node, ParallelMCTS
 from transformer import PositionalEncoding, TransformerLayer, Transformer
 from utils import compare_routing_states, embed_nodes
 
@@ -587,3 +587,54 @@ def test_mcts():
 #             assert child.value == max_val
 #         else:
 #             assert child.value <= max_val
+
+def test_validate_mcts_output():
+    mp.set_start_method("spawn", force=True)
+
+    connection_graph = nx.Graph()
+    connection_graph.add_edges_from([(0, 1), (1, 2), (2,3), (3,4), (4,5), (5,6), (6,7)])
+    # connection_graph.add_edges_from([(0,1), (1,2), (2,3), (3,4), (4,5), (5,6)])
+
+    embedding_dim = 20
+    embedding_dim_inc = 21
+    padding_dim = 3
+    num_heads = 6
+    num_layers = 4
+    d_model = 216
+    lookahead_length = 48
+
+
+    env = Routing(
+        max_observation_reach=LOOKAHEAD_LENGTH,
+        observe_legal_surpasses=True,
+        observe_connection_graph=True,
+        connection_graph=connection_graph,
+        render_mode="rgb_array",
+        rewarder=None,
+        interaction_generator=CustomInteractionGenerator()
+    )
+
+    env.reset()
+
+    transformer = Transformer(embedding_dim=embedding_dim_inc + padding_dim, num_heads=num_heads, d_model=d_model, ffn_dim=4*d_model,
+                              num_layers=num_layers, lookahead_length=lookahead_length,
+                              swap_options=connection_graph.number_of_edges(), device=torch.device("cpu"))
+
+    rollouts = 200
+    processes = 1
+    # c_constant = math.sqrt(2)
+    c_constant = 100
+
+    mcts = ParallelMCTS(transformer=transformer,
+                        qubit_embedding=nn.Embedding(num_embeddings=connection_graph.number_of_nodes(), embedding_dim=embedding_dim),
+                        device=torch.device("cpu"),swap_options=connection_graph.number_of_edges(), rollouts=rollouts,
+                        lookahead_length=lookahead_length, embedding_dim=embedding_dim, padding_dim=padding_dim,
+                        processes=processes, merge_worker_trees=False, c=c_constant)
+
+    actions, state_values = mcts.run_parallel([env._state])
+    mcts.close_workers()
+
+    print(f'Output actions: {actions}')
+    print(f'Output state values: {state_values}')
+
+    assert actions[0] == 0 or actions[0] == connection_graph.number_of_edges() - 1
