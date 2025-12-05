@@ -43,12 +43,14 @@ NUM_LAYERS = 4          # AR paper number of transformer layers
 D_MODEL = 216
 FFN_DIM = 4 * D_MODEL            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 5
+MCTS_PROCESSES: int = 6
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
-LEARNING_RATE = 1e-1
+# LEARNING_RATE = 2e-5
+# LEARNING_RATE = 1e-2
+LEARNING_RATE = 1e-2
 WEIGHT_DECAY = 0
 LR_DECAY_STEP = N_ENVS * 2
 LR_DECAY = 0.8
@@ -58,6 +60,7 @@ LOSS_COEFFICIENT = 0.1
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
 TEMP_BUFFER_DIR = TEMP_MODEL_DIR.joinpath('buffers/')
+TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
 LOG_DIR = Path(__file__).resolve().parent.joinpath('logs/')
 
 def render_rgb(env):
@@ -188,7 +191,10 @@ class AlphaRouterAgent(nn.Module):
         # state: RoutingState = self.env._state
         # connection_graph = state.connection_graph
         self.qubit_embedding = nn.Embedding(num_embeddings=connection_graph.number_of_nodes(),
-                                            embedding_dim=embedding_dim).to(self.device)
+                                            embedding_dim=embedding_dim)
+        # nn.init.xavier_uniform_(self.qubit_embedding.weight)
+        self.qubit_embedding.weight.share_memory_()
+        print(self.qubit_embedding.weight)
         self.loss_coefficient = loss_coefficient
         self.action_space_size = len(connection_graph.edges)
 
@@ -202,7 +208,8 @@ class AlphaRouterAgent(nn.Module):
         else:
             self.padding_dim = 0
 
-        self.transformer = Transformer(embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length, swap_options=self.action_space_size, device=self.device).to(self.device)
+        self.transformer = Transformer(embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length,
+                                       swap_options=self.action_space_size, device=self.device).to(self.device)
         self.replay_buffer = ReplayBuffer(
             buffer_size,
             self.device
@@ -274,7 +281,7 @@ class AlphaRouterAgent(nn.Module):
             action, log_prob, _, _ = self.transformer(state_embedding.unsqueeze(0))
             observation, reward, done, truncated, info = self.env.step(action)
 
-            self.replay_buffer.store(old_state, action, reward, self.env._state, done)
+            self.replay_buffer.store(old_state, action, reward, deepcopy(self.env._state), done)
 
             log_probs.append(log_prob)
             rewards.append(reward)
@@ -337,6 +344,8 @@ class AlphaRouterAgent(nn.Module):
             dim=0
         ).to(self.device)
 
+        # print(f'Loop embeddings: {state_embeddings}')
+
         # assert state_embeddings.shape[1] is LOOKAHEAD_LENGTH
 
         done_list = [False] * N_ENVS
@@ -347,8 +356,17 @@ class AlphaRouterAgent(nn.Module):
 
             actions, _, _, _, _ = self.transformer(state_embeddings)
 
+            if isinstance(actions, Tensor):
+                actions = actions.cpu().numpy()
+
             observations, rewards, terminated, truncated, info = self.vec_env.step(actions)
             done = np.logical_or(terminated, truncated)
+
+            # print(f'env 0 state mapping: {self.vec_env.envs[0]._state.mapping}')
+
+            # print(actions)
+            # print(old_states[0].mapping)
+            # print(self.vec_env.envs[0]._state.mapping)
 
             for i in range(N_ENVS):
                 if done_list[i] or done[i]:
@@ -383,6 +401,8 @@ class AlphaRouterAgent(nn.Module):
                 self.replay_buffer.store(old_states[i], actions[i], None,
                                          self.vec_env.envs[i]._state, done_list[i])
             state_embeddings = new_embeddings
+            # print(f'Loop embeddings: {state_embeddings}')
+            # print(f'state: {self.vec_env.envs[0]._state}')
 
         # returns, mask = compute_returns_batched(reward_list, device=self.device)
 
@@ -413,6 +433,10 @@ class AlphaRouterAgent(nn.Module):
         if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
             mcts_input = self.replay_buffer.sample(MCTS_PROCESSES)
             # print(f'mcts_input: {mcts_input}')
+
+            # if self.device != torch.device('cpu'):
+            torch.save(self.transformer.state_dict(), TEMP_TRANSFORMER_DIR)
+
             mcts_actions, mcts_state_evals = self.mcts.run_parallel(mcts_input)
             # print(f'mcts_action: {mcts_actions}')
             # print(f'mcts_state_evals: {mcts_state_evals}')
@@ -423,6 +447,16 @@ class AlphaRouterAgent(nn.Module):
                 dim=0
             ).to(self.device)
 
+            # device = swap_scores.device
+            # teacher_actions = torch.tensor(mcts_actions, dtype=torch.long, device=device)  # (B,)
+            # mcts_vals = torch.tensor(mcts_state_evals, dtype=torch.float32, device=device)  # (B,)
+            #
+            # # Cross-entropy: higher stability and correct handling:
+            # ce_loss = torch.nn.functional.cross_entropy(swap_scores, teacher_actions, reduction='none')  # (B,)
+            #
+            # # MSE between transformer state_values and QMCTS
+            # mse_loss = torch.nn.functional.mse_loss(state_values, mcts_vals, reduction='none')  # (B,)
+
             # transformer_actions, transformer_log_probs, transformer_state_evals = self.get_action(embeddings)
             transformer_actions, _, transformer_state_evals, transformer_all_log_probs, state_values = self.transformer(embeddings)
             # print(f'transformer_log_probs: {transformer_all_log_probs}')
@@ -430,6 +464,7 @@ class AlphaRouterAgent(nn.Module):
             print(f'### l1: {l1}')
             mcts_state_evals = torch.tensor(mcts_state_evals, dtype=transformer_all_log_probs.dtype, device=transformer_all_log_probs.device)
             l2 = (state_values - mcts_state_evals).pow(2)
+            # l2 = torch.nn.functional.mse_loss(state_values, mcts_state_evals, reduction='none')
             print(f'### l2: {l2}')
             loss = (l1 + self.loss_coefficient * l2) / self.action_space_size
             print(f'### loss: {loss}')
@@ -480,11 +515,14 @@ class AlphaRouterAgent(nn.Module):
         :batch: If true - computes in batches with B=N_ENV
         """
         print("MCTS Init")
+        print(self.qubit_embedding.weight)
+        self.qubit_embedding.cpu()
         self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device,
                                  swap_options=self.action_space_size, lookahead_length=self.lookahead_length,
                                  embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200,
                                  processes=MCTS_PROCESSES, merge_worker_trees=False)
         print("MCTS Init successful")
+        print(self.qubit_embedding.weight)
 
         if total_timesteps % N_ENVS != 0:
             total_timesteps -= (total_timesteps % N_ENVS)
@@ -494,6 +532,8 @@ class AlphaRouterAgent(nn.Module):
         losses_l1 = []
         losses_l2 = []
         snapshot = 0
+
+        start = time.time()
 
         if not batch:
             for i in range(int(total_timesteps)):
@@ -515,11 +555,15 @@ class AlphaRouterAgent(nn.Module):
                 losses_l2.extend(l2)
                 returns.extend(ep_return.detach().cpu())
 
+                self.scheduler.step()
+
                 if i != 0 and (i * N_ENVS) % 512 == 0:
                     self.save_snapshot(snapshot)
                     snapshot += 1
 
         self.mcts.close_workers()
+
+        end = time.time()
 
         ma_swaps = moving_average(swaps, window=ma_window)
         ma_loss = moving_average(losses, window=ma_window)
@@ -547,6 +591,7 @@ class AlphaRouterAgent(nn.Module):
             f.write(f'ma_loss_l2: {ma_loss_l2}\n')
             f.write(f"Success count: {self.success_count}\n")
             f.write(f"Success %: {self.success_count / total_timesteps * 100}\n")
+            f.write(f'The training took: {end - start} seconds\n')
 
         episodes = range(1, total_timesteps + 1)
         mcts_games = range(1, len(losses) + 1)
@@ -564,8 +609,9 @@ class AlphaRouterAgent(nn.Module):
 
     def forward(self, env: Routing, plot: bool = False):
         state: RoutingState = env._state
-
         assert len(state.connection_graph.edges) == self.action_space_size
+
+        self.qubit_embedding.to(torch.device('cpu'))
 
         actions = []
 
@@ -576,14 +622,18 @@ class AlphaRouterAgent(nn.Module):
             if plot:
                 plot_mapping_and_circuit(env._state.connection_graph, env._state.mapping, env._state.interaction_circuit)
                 time.sleep(0.1)
-            node_embedding = embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
+            node_embedding = embed_nodes(env._state, self.lookahead_length, self.device, self.qubit_embedding,
                         self.embedding_dim, self.padding_dim)
             node_embedding = node_embedding.unsqueeze(0)  # now shape (1, T, E)
             transformer_action, _, _, _, _ = self.transformer(node_embedding)
 
+            if isinstance(transformer_action, Tensor):
+                transformer_action = transformer_action.cpu().item()
+
             observation, reward, done, truncated, info = env.step(transformer_action)
             actions.append(transformer_action)
 
+            # print(f'action: {transformer_action}')
             # print(f'mapping: {env._state.mapping}')
             # print(f'env._state.interaction_circuit[env._state.position]: {env._state.interaction_circuit[env._state.position]}')
             # print(f'is_legal_surpass: {env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position])}')
@@ -609,10 +659,10 @@ if __name__ == '__main__':
     boost_process_priority()
 
     connection_graph = nx.Graph()
-    # connection_graph.add_edges_from([(0,1), (1,2)])
+    connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
 
-    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
+    # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
 
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (5,6), (6,7), (7,8), (8,9), (10,11),(11,12),(12,13), (13,14), (0,5), (5, 10), (1, 6), (6,11), (2,7), (7,12), (3,8), (8,13), (4,9), (9,14)])
     # width = 5
@@ -629,16 +679,17 @@ if __name__ == '__main__':
     path = MODEL_DIR.joinpath(f"model_1028_far_gate_patched_qgym_paper_hyper_2-{get_timestamp()}.pt")
     print(path)
 
-    # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
-    #                          device=device, episode_limit=250).to(device)
     model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
-                             device=device, episode_limit=150, loss_coefficient=LOSS_COEFFICIENT).to(device)
+                             device=device, episode_limit=30, loss_coefficient=LOSS_COEFFICIENT).to(device)
+    # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
+    #                          device=device, episode_limit=60, loss_coefficient=LOSS_COEFFICIENT,
+    #                          num_heads=2, num_layers=2, d_model=32, ffn_dim=8).to(device)
     # model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
 
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(1028, batch=True)
+    model.learn(512, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
@@ -672,14 +723,19 @@ if __name__ == '__main__':
         interaction_generator=CustomInteractionGenerator()
     )
 
-    inference_model = AlphaRouterAgent(connection_graph=connection_graph, device=device, episode_limit=400).to(device)
+    ### LOAD A SPECIFIC MODEL INSTEAD OF THE LAST ONE???
+    # path = MODEL_DIR.joinpath(f"model_1028_far_gate_patched_qgym_paper_hyper_2-2025-12-04T11-27-24-601885.pt")
+
+    inference_model = AlphaRouterAgent(connection_graph=connection_graph, device=device, episode_limit=90).to(device)
+    # inference_model = AlphaRouterAgent(connection_graph=connection_graph, device=device, episode_limit=90,
+    #                                    num_heads=2, num_layers=2, d_model=32, ffn_dim=8).to(device)
     inference_model.load_state_dict(torch.load(path, weights_only=True))
     inference_model.eval()
     # inference_model.train()
     print('Model loaded successfully')
     # print(f"Model loaded: {inference_model.state_dict()}")
 
-    for i in range(1):
+    for i in range(10):
         env.reset()
         actions = inference_model(env, plot=False)
         print('### ### ###')
@@ -687,21 +743,3 @@ if __name__ == '__main__':
         print(f'actions: {actions}')
 
     print('Successful inference')
-
-    # B = 32
-    # 165.20124554634094
-    # 104.16623425483704
-
-    # Before vectorization (B = 64)
-    # 162.52327227592468
-    # 96.18174529075623
-
-    # After vectorization (B = 64)
-    # 147.20666241645813
-    # 98.53906488418579
-
-    # B = 128
-    # 131.8683156967163
-    # 90.94579315185547
-
-    # 276.61190009117126
