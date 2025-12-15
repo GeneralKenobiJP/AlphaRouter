@@ -24,13 +24,15 @@ from manhattan_rewarder import ManhattanRewarder
 from plotting import plot_mcts_tree
 from transformer import Transformer
 from utils import embed_nodes, compute_returns, boost_process_priority, compare_routing_states, \
-    surpass_all_possible_gates
+    surpass_all_possible_gates, standard_reward
 
 mp.set_start_method("spawn", force=True)
 
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
 TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
+
+CHECKPOINT_PERIOD = 3
 
 
 def gen_hash(state: RoutingState):
@@ -269,10 +271,12 @@ class MCTSWorker:
         self.padding_dim = padding_dim
         # self.rewarder = ManhattanRewarder()
         # NOTE: the rewarder does not do anything at the moment
-        self.rewarder = BasicRewarder(illegal_action_penalty=0, penalty_per_swap=-1, reward_per_surpass=1)
+        # self.rewarder = BasicRewarder(illegal_action_penalty=0, penalty_per_swap=-1, reward_per_surpass=1)
         self.inference_queue: mp.Queue | None = None
         self.output_queue: mp.Queue | None = None
         self.idx = idx
+        self.checkpoint_period = CHECKPOINT_PERIOD
+        self.partial_rewarder = ManhattanRewarder()
 
     def set_root(self, state: RoutingState) -> None:
         surpass_all_possible_gates(state)
@@ -396,11 +400,15 @@ class MCTSWorker:
             #         reward += self.rewarder.compute_reward(old_state=path_states[i+1], action=self.swap_options,
             #                                                new_state=path_states[i])
             # reward = self.rewarder.compute_reward(old_state=path_states[-1], action=0, new_state=path_states[0])
-            reward = (path_states[0].position) - (len(path_actions) - 1) - 1
+            # reward = (path_states[0].position) - (len(path_actions) - 1)
+            reward = standard_reward(path_states)
 
-        for (state, action) in zip(path_states, path_actions):
+        for idx, (state, action) in enumerate(zip(path_states, path_actions)):
             node = self.get_transposition(gen_hash(state))
             node.visits += 1
+            if idx % self.checkpoint_period == 0:
+                node.value += self.partial_rewarder.compute_reward(old_state=None, action = None, new_state=state)
+                continue
             if isinstance(reward, Tensor):
                 node.value += reward.item()
             else:

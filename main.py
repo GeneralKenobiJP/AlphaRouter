@@ -43,14 +43,14 @@ NUM_LAYERS = 4          # AR paper number of transformer layers
 D_MODEL = 216
 FFN_DIM = 4 * D_MODEL            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 6
+MCTS_PROCESSES: int = 5
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 # LEARNING_RATE = 2e-5
 # LEARNING_RATE = 1e-2
-LEARNING_RATE = 1e-2
+LEARNING_RATE = 2e-2
 WEIGHT_DECAY = 0
 LR_DECAY_STEP = N_ENVS * 2
 LR_DECAY = 0.8
@@ -165,7 +165,7 @@ class AlphaRouterAgent(nn.Module):
     def __init__(self, connection_graph: nx.Graph, interaction_generator: InteractionGenerator | None = None,
                  device: Device = torch.device("cpu"), embedding_dim: int = 20, num_heads: int = 6, d_model: int = D_MODEL, ffn_dim: int = FFN_DIM,
                  num_layers: int = 4, lookahead_length: int = 48, buffer_size: int = int(1e6), episode_limit: int = 150,
-                 loss_coefficient: float = 0.00005, *args, **kwargs):
+                 loss_coefficient: float = LOSS_COEFFICIENT, *args, **kwargs):
         """
         :param env: Particular routing environment we want to apply the agent to
         :param device: Device to run the agent on (cuda for Nvidia graphics card, cpu for a standard cpu)
@@ -659,10 +659,10 @@ if __name__ == '__main__':
     boost_process_priority()
 
     connection_graph = nx.Graph()
-    connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
+    # connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
 
-    # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
+    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
 
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (5,6), (6,7), (7,8), (8,9), (10,11),(11,12),(12,13), (13,14), (0,5), (5, 10), (1, 6), (6,11), (2,7), (7,12), (3,8), (8,13), (4,9), (9,14)])
     # width = 5
@@ -689,7 +689,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(512, batch=True)
+    model.learn(2048, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 

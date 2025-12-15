@@ -285,3 +285,14 @@ def open_binary(path: Path, mode: str = 'rb', compress: Optional[str] = None):
 
 def get_timestamp():
     return str(datetime.datetime.now().isoformat()).replace(':', '-').replace('.', '-')
+
+def _standard_reward(gates_routed: int, path_length: int) -> int:
+    return gates_routed - path_length
+
+def standard_reward(path_states: list[RoutingState]) -> int:
+    if len(path_states) <= 1:
+        return 0
+
+    new_gates_routed = path_states[0].position - path_states[-1].position
+
+    return _standard_reward(new_gates_routed, len(path_states) - 1)
