@@ -24,7 +24,7 @@ from manhattan_rewarder import ManhattanRewarder
 from plotting import plot_mcts_tree
 from transformer import Transformer
 from utils import embed_nodes, compute_returns, boost_process_priority, compare_routing_states, \
-    surpass_all_possible_gates, standard_reward
+    surpass_all_possible_gates, standard_reward, ratio_reward
 
 mp.set_start_method("spawn", force=True)
 
@@ -401,7 +401,7 @@ class MCTSWorker:
             #                                                new_state=path_states[i])
             # reward = self.rewarder.compute_reward(old_state=path_states[-1], action=0, new_state=path_states[0])
             # reward = (path_states[0].position) - (len(path_actions) - 1)
-            reward = standard_reward(path_states)
+            reward = ratio_reward(path_states)
             is_terminal = True
         else:
             is_terminal = False

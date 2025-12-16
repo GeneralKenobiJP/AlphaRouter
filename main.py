@@ -43,14 +43,14 @@ NUM_LAYERS = 4          # AR paper number of transformer layers
 D_MODEL = 216
 FFN_DIM = 4 * D_MODEL            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 5
+MCTS_PROCESSES: int = 4
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 # LEARNING_RATE = 2e-5
 # LEARNING_RATE = 1e-2
-LEARNING_RATE = 2e-2
+LEARNING_RATE = 1e-2
 WEIGHT_DECAY = 0
 LR_DECAY_STEP = N_ENVS * 2
 LR_DECAY = 0.8
@@ -680,7 +680,7 @@ if __name__ == '__main__':
     print(path)
 
     model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
-                             device=device, episode_limit=30, loss_coefficient=LOSS_COEFFICIENT).to(device)
+                             device=device, episode_limit=150, loss_coefficient=LOSS_COEFFICIENT).to(device)
     # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
     #                          device=device, episode_limit=60, loss_coefficient=LOSS_COEFFICIENT,
     #                          num_heads=2, num_layers=2, d_model=32, ffn_dim=8).to(device)
@@ -689,7 +689,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(2048, batch=True)
+    model.learn(1024 + 512, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 

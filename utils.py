@@ -296,3 +296,14 @@ def standard_reward(path_states: list[RoutingState]) -> int:
     new_gates_routed = path_states[0].position - path_states[-1].position
 
     return _standard_reward(new_gates_routed, len(path_states) - 1)
+
+def _ratio_reward(gates_routed: int, path_length: int) -> float:
+    return gates_routed / path_length
+
+def ratio_reward(path_states: list[RoutingState]) -> float:
+    if len(path_states) <= 1:
+        return 0
+
+    new_gates_routed = path_states[0].position - path_states[-1].position
+
+    return _ratio_reward(new_gates_routed, len(path_states) - 1)
