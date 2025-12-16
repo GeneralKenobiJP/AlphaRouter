@@ -61,6 +61,7 @@ MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
 TEMP_BUFFER_DIR = TEMP_MODEL_DIR.joinpath('buffers/')
 TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
+TEMP_EMBEDDING_DIR = TEMP_MODEL_DIR.joinpath('temp_embedding.pt')
 LOG_DIR = Path(__file__).resolve().parent.joinpath('logs/')
 
 def render_rgb(env):
@@ -435,9 +436,13 @@ class AlphaRouterAgent(nn.Module):
             # print(f'mcts_input: {mcts_input}')
 
             # if self.device != torch.device('cpu'):
-            torch.save(self.transformer.state_dict(), TEMP_TRANSFORMER_DIR)
+            # torch.save(self.transformer.state_dict(), TEMP_TRANSFORMER_DIR)
+            torch.save(self.qubit_embedding.state_dict(), TEMP_EMBEDDING_DIR)
+            self.transformer.cpu()
 
             mcts_actions, mcts_state_evals = self.mcts.run_parallel(mcts_input)
+
+            self.transformer.to(self.device)
             # print(f'mcts_action: {mcts_actions}')
             # print(f'mcts_state_evals: {mcts_state_evals}')
 
@@ -522,6 +527,7 @@ class AlphaRouterAgent(nn.Module):
                                  embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200,
                                  processes=MCTS_PROCESSES, merge_worker_trees=False)
         print("MCTS Init successful")
+        self.qubit_embedding.to(self.device)
         print(self.qubit_embedding.weight)
 
         if total_timesteps % N_ENVS != 0:

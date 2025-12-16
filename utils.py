@@ -88,8 +88,8 @@ def embed_nodes(state: RoutingState, lookahead_length: int, device: Device, qubi
     #         print(f"could not inspect weight: {e}")
 
     # Pre-generate physical qubit embeddings
-    phys_qubits = torch.arange(state.n_qubits, dtype=torch.long, device=torch.device('cpu'))
-    embeddings = qubit_embedding(phys_qubits).to(device)
+    phys_qubits = torch.arange(state.n_qubits, dtype=torch.long, device=device)
+    embeddings = qubit_embedding(phys_qubits)
     # print(f'Embed nodes: embeddings: {embeddings}')
 
     feature_matrix = []

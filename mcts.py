@@ -31,6 +31,7 @@ mp.set_start_method("spawn", force=True)
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
 TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
+TEMP_EMBEDDING_DIR = TEMP_MODEL_DIR.joinpath('temp_embedding.pt')
 
 CHECKPOINT_PERIOD = 4
 
@@ -278,6 +279,8 @@ class MCTSWorker:
         self.checkpoint_period = CHECKPOINT_PERIOD
         self.partial_rewarder = ManhattanRewarder(self.swap_options + 1)
 
+        self.qubit_embedding.to(self.device)
+
     def set_root(self, state: RoutingState) -> None:
         surpass_all_possible_gates(state)
         hash = gen_hash(state)
@@ -445,6 +448,8 @@ class MCTSWorker:
         if clear_tree:
             self.transposition_table = dict()
 
+        self.qubit_embedding.load_state_dict(torch.load(TEMP_EMBEDDING_DIR, weights_only=True, map_location=self.device))
+
         self.set_root(root_state)
 
         with torch.no_grad():
@@ -548,8 +553,9 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
 
     boost_process_priority()
 
-    transformer = deepcopy(transformer)
-    transformer.load_state_dict(torch.load(TEMP_TRANSFORMER_DIR, weights_only=True, map_location=transformer.device))
+    # transformer = deepcopy(transformer)
+    transformer.to(transformer.device)
+    # transformer.load_state_dict(torch.load(TEMP_TRANSFORMER_DIR, weights_only=True, map_location=transformer.device))
     # transformer.eval()
 
     while True:
