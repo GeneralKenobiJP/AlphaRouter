@@ -32,7 +32,7 @@ MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
 TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
 
-CHECKPOINT_PERIOD = 3
+CHECKPOINT_PERIOD = 4
 
 
 def gen_hash(state: RoutingState):
@@ -276,7 +276,7 @@ class MCTSWorker:
         self.output_queue: mp.Queue | None = None
         self.idx = idx
         self.checkpoint_period = CHECKPOINT_PERIOD
-        self.partial_rewarder = ManhattanRewarder()
+        self.partial_rewarder = ManhattanRewarder(self.swap_options + 1)
 
     def set_root(self, state: RoutingState) -> None:
         surpass_all_possible_gates(state)
@@ -402,13 +402,21 @@ class MCTSWorker:
             # reward = self.rewarder.compute_reward(old_state=path_states[-1], action=0, new_state=path_states[0])
             # reward = (path_states[0].position) - (len(path_actions) - 1)
             reward = standard_reward(path_states)
+            is_terminal = True
+        else:
+            is_terminal = False
 
-        for idx, (state, action) in enumerate(zip(path_states, path_actions)):
+        for i, (state, action) in enumerate(zip(path_states, path_actions)):
             node = self.get_transposition(gen_hash(state))
             node.visits += 1
-            if idx % self.checkpoint_period == 0:
-                node.value += self.partial_rewarder.compute_reward(old_state=None, action = None, new_state=state)
-                continue
+
+            idx = len(path_states) - i - 1
+
+            if idx % self.checkpoint_period == 0 and i != 0 and idx != 0:
+                node.value += self.partial_rewarder.compute_reward(old_state=path_states[i+1], action = action, new_state=state)
+                if not is_terminal:
+                    continue
+
             if isinstance(reward, Tensor):
                 node.value += reward.item()
             else:
@@ -633,7 +641,7 @@ class ParallelMCTS:
         self.lookahead_length = lookahead_length
         self.embedding_dim = embedding_dim
         self.padding_dim = padding_dim
-        self.rewarder = ManhattanRewarder()
+        # self.rewarder = ManhattanRewarder()
         self.processes = processes
         self.manager = mp.Manager()
         self.inference_queue = self.manager.Queue()
