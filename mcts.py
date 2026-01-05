@@ -118,9 +118,9 @@ class MCTS:
             self.root = node
 
     def ucb(self, root: Node, node: Node) -> float:
-        return (node.value / (node.visits + 1e-6) +
+        return (node.value / (node.visits + 1 + 1e-6) +
                 self.c_constant * math.sqrt(
-                    math.log(root.visits + 1e-6) / (node.visits + 1e-6)
+                    math.log(root.visits + 1 + 1e-6) / (node.visits + 1e-6)
                 ))
 
     def select_child(self, root: Node, path_states: List[RoutingState] = None) -> (Node, int):
@@ -350,9 +350,9 @@ class MCTSWorker:
         self.output_queue = output_queue
 
     def ucb(self, root: Node, node: Node) -> float:
-        return (node.value / (node.visits + 1e-6) +
+        return (node.value / (node.visits + 1 + 1e-6) +
                 self.c_constant * math.sqrt(
-                    math.log(root.visits + 1e-6) / (node.visits + 1e-6)
+                    math.log(root.visits + 1 + 1e-6) / (node.visits + 1e-6)
                 ))
 
     def select_child(self, root: Node, path_states: List[RoutingState] = None) -> (Node, int):

@@ -43,19 +43,19 @@ NUM_LAYERS = 4          # AR paper number of transformer layers
 D_MODEL = 216
 FFN_DIM = 4 * D_MODEL            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 1
+MCTS_PROCESSES: int = 4
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 # LEARNING_RATE = 2e-5
 # LEARNING_RATE = 1e-2
-LEARNING_RATE = 1e-2
+LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0
 LR_DECAY_STEP = N_ENVS * 2
 LR_DECAY = 0.8
 MAX_GRAD_NORM = 5
-LOSS_COEFFICIENT = 0.1
+LOSS_COEFFICIENT = 10
 
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
@@ -120,7 +120,7 @@ class ReplayBuffer:
         # stored_action = (action.detach() if isinstance(action, torch.Tensor)
         #                  else action)
         # self.buffer.append((state, stored_action, reward, deepcopy(next_state), done))
-        self.buffer.append(state)
+        self.buffer.append(deepcopy(state))
 
     def sample(self, batch_size: int):
         """
@@ -405,20 +405,6 @@ class AlphaRouterAgent(nn.Module):
             # print(f'Loop embeddings: {state_embeddings}')
             # print(f'state: {self.vec_env.envs[0]._state}')
 
-        # returns, mask = compute_returns_batched(reward_list, device=self.device)
-
-        # Convert log_prob_list to tensor for fast on-device computation
-        # for i in range(N_ENVS):
-        #     log_prob_list[i] = torch.stack(log_prob_list[i])
-        # log_prob_tensor = torch.nn.utils.rnn.pad_sequence(log_prob_list, batch_first=True, padding_value=0.0).to(
-        #     self.device)  # (B, T)
-
-        # Policy gradient loss:
-        #  per-episode sum_t (log_prob * G_t), then mean across batch
-        # note: multiply by mask to ignore padding
-        # per_episode_loss = - (log_prob_tensor * returns * mask).sum(dim=1)  # (B,)
-        # policy_loss = per_episode_loss.mean()
-
         # backprop / gradient step
         # self.scaler.scale(policy_loss).backward()
         # self.scaler.step(self.optimizer)
@@ -443,6 +429,8 @@ class AlphaRouterAgent(nn.Module):
                 self.transformer.cpu()
 
             mcts_actions, mcts_state_evals = self.mcts.run(mcts_input)
+
+            self.transformer.train()
 
             if MCTS_PROCESSES > 1:
                 self.transformer.to(self.device)
@@ -499,9 +487,6 @@ class AlphaRouterAgent(nn.Module):
             mean_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.parameters(), MAX_GRAD_NORM)
             self.optimizer.step()
-
-        # Return undiscounted returns per env for plotting and analysis
-        # undiscounted_returns = torch.tensor([sum(r) for r in reward_list], dtype=torch.float32, device=self.device)
 
         # return policy_loss, swaps, undiscounted_returns
         if isinstance(loss, torch.Tensor):
@@ -610,7 +595,7 @@ class AlphaRouterAgent(nn.Module):
             f.write(f'loss_coefficient: {LOSS_COEFFICIENT}\n')
             f.write(f'max_grad_norm: {MAX_GRAD_NORM}\n')
             f.write(f'N_ENVS: {N_ENVS}\n')
-            f.write(f'N_MCTS_WORKERS: {len(self.mcts.workers)}\n')
+            f.write(f'N_MCTS_WORKERS: {MCTS_PROCESSES}\n')
             f.write(f'ma_swaps: {ma_swaps}\n')
             f.write(f'ma_loss: {ma_loss}\n')
             f.write(f'ma_loss_l1: {ma_loss_l1}\n')
@@ -637,7 +622,7 @@ class AlphaRouterAgent(nn.Module):
         state: RoutingState = env._state
         assert len(state.connection_graph.edges) == self.action_space_size
 
-        self.qubit_embedding.to(torch.device('cpu'))
+        # self.qubit_embedding.to(torch.device('cpu'))
 
         actions = []
 
@@ -705,7 +690,7 @@ if __name__ == '__main__':
     path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
     print(path)
 
-    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=None,
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
                              device=device, episode_limit=150, loss_coefficient=LOSS_COEFFICIENT).to(device)
     # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
     #                          device=device, episode_limit=60, loss_coefficient=LOSS_COEFFICIENT,
@@ -715,7 +700,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(1024, batch=True)
+    model.learn(512, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
