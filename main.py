@@ -25,7 +25,7 @@ from torch.types import Device
 from torchviz import make_dot
 
 from custom_interaction_generator import CustomInteractionGenerator
-from mcts import ParallelMCTS
+from mcts import ParallelMCTS, MCTS
 from plotting import moving_average, plot, plot_mapping_and_circuit
 from manhattan_rewarder import ManhattanRewarder
 
@@ -43,7 +43,7 @@ NUM_LAYERS = 4          # AR paper number of transformer layers
 D_MODEL = 216
 FFN_DIM = 4 * D_MODEL            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 4
+MCTS_PROCESSES: int = 1
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
@@ -215,7 +215,7 @@ class AlphaRouterAgent(nn.Module):
             buffer_size,
             self.device
         )
-        self.mcts: ParallelMCTS | None = None
+        self.mcts: ParallelMCTS | MCTS | None = None
 
         self.to(self.device)
 
@@ -438,11 +438,15 @@ class AlphaRouterAgent(nn.Module):
             # if self.device != torch.device('cpu'):
             # torch.save(self.transformer.state_dict(), TEMP_TRANSFORMER_DIR)
             torch.save(self.qubit_embedding.state_dict(), TEMP_EMBEDDING_DIR)
-            self.transformer.cpu()
 
-            mcts_actions, mcts_state_evals = self.mcts.run_parallel(mcts_input)
+            if MCTS_PROCESSES > 1:
+                self.transformer.cpu()
 
-            self.transformer.to(self.device)
+            mcts_actions, mcts_state_evals = self.mcts.run(mcts_input)
+
+            if MCTS_PROCESSES > 1:
+                self.transformer.to(self.device)
+
             # print(f'mcts_action: {mcts_actions}')
             # print(f'mcts_state_evals: {mcts_state_evals}')
 
@@ -465,7 +469,10 @@ class AlphaRouterAgent(nn.Module):
             # transformer_actions, transformer_log_probs, transformer_state_evals = self.get_action(embeddings)
             transformer_actions, _, transformer_state_evals, transformer_all_log_probs, state_values = self.transformer(embeddings)
             # print(f'transformer_log_probs: {transformer_all_log_probs}')
-            l1 = torch.stack([-batch_log_probs[idx] for batch_log_probs, idx in zip(transformer_all_log_probs, mcts_actions)])
+            if isinstance(mcts_actions, list):
+                l1 = torch.stack([-batch_log_probs[idx] for batch_log_probs, idx in zip(transformer_all_log_probs, mcts_actions)])
+            else:
+                l1 = -transformer_all_log_probs[0]
             print(f'### l1: {l1}')
             mcts_state_evals = torch.tensor(mcts_state_evals, dtype=transformer_all_log_probs.dtype, device=transformer_all_log_probs.device)
             l2 = (state_values - mcts_state_evals).pow(2)
@@ -476,10 +483,15 @@ class AlphaRouterAgent(nn.Module):
             mean_loss = loss.mean()
             print(f'### mean_loss: {mean_loss}')
 
-            for state, transformer_action, mcts_action in zip(mcts_input, transformer_actions, mcts_actions):
-                print(f'### state: {state}')
-                print(f'### transformer_action: {transformer_action}')
-                print(f'### mcts_action: {mcts_action}')
+            if isinstance(mcts_actions, list):
+                for state, transformer_action, mcts_action in zip(mcts_input, transformer_actions, mcts_actions):
+                    print(f'### state: {state}')
+                    print(f'### transformer_action: {transformer_action}')
+                    print(f'### mcts_action: {mcts_action}')
+            else:
+                print(f'### state: {mcts_input[0]}')
+                print(f'### transformer_action: {transformer_actions[0]}')
+                print(f'### mcts_action: {mcts_actions}')
 
             # self.scaler.scale(mean_loss).backward()
             # self.scaler.step(self.optimizer)
@@ -519,16 +531,23 @@ class AlphaRouterAgent(nn.Module):
         :param ma_window: The size of the moving average window used for filtering out noise in the graphs
         :batch: If true - computes in batches with B=N_ENV
         """
-        print("MCTS Init")
-        print(self.qubit_embedding.weight)
-        self.qubit_embedding.cpu()
-        self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device,
-                                 swap_options=self.action_space_size, lookahead_length=self.lookahead_length,
-                                 embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200,
-                                 processes=MCTS_PROCESSES, merge_worker_trees=False)
-        print("MCTS Init successful")
-        self.qubit_embedding.to(self.device)
-        print(self.qubit_embedding.weight)
+        if MCTS_PROCESSES > 1:
+            print("Parallel MCTS Init")
+            print(self.qubit_embedding.weight)
+            self.qubit_embedding.cpu()
+            self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device,
+                                     swap_options=self.action_space_size, lookahead_length=self.lookahead_length,
+                                     embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200,
+                                     processes=MCTS_PROCESSES, merge_worker_trees=False)
+            print("Parallel MCTS Init successful")
+            self.qubit_embedding.to(self.device)
+            print(self.qubit_embedding.weight)
+        else:
+            print("MCTS Init")
+            self.mcts = MCTS(self.transformer, self.qubit_embedding, self.device,
+                                     swap_options=self.action_space_size, lookahead_length=self.lookahead_length,
+                                     embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200)
+            print("MCTS Init successful")
 
         if total_timesteps % N_ENVS != 0:
             total_timesteps -= (total_timesteps % N_ENVS)
@@ -567,7 +586,8 @@ class AlphaRouterAgent(nn.Module):
                     self.save_snapshot(snapshot)
                     snapshot += 1
 
-        self.mcts.close_workers()
+        if MCTS_PROCESSES > 1:
+            self.mcts.close_workers()
 
         end = time.time()
 
@@ -682,10 +702,10 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # device = torch.device("cpu")
     print(f"device: {device}")
-    path = MODEL_DIR.joinpath(f"model_1028_far_gate_patched_qgym_paper_hyper_2-{get_timestamp()}.pt")
+    path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
     print(path)
 
-    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=None,
                              device=device, episode_limit=150, loss_coefficient=LOSS_COEFFICIENT).to(device)
     # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
     #                          device=device, episode_limit=60, loss_coefficient=LOSS_COEFFICIENT,
@@ -695,7 +715,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(1024 + 512, batch=True)
+    model.learn(1024, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 

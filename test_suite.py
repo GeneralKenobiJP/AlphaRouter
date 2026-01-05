@@ -631,7 +631,7 @@ def test_validate_mcts_output():
                         lookahead_length=lookahead_length, embedding_dim=embedding_dim, padding_dim=padding_dim,
                         processes=processes, merge_worker_trees=False, c=c_constant)
 
-    actions, state_values = mcts.run_parallel([env._state])
+    actions, state_values = mcts.run([env._state])
     mcts.close_workers()
 
     print(f'Output actions: {actions}')

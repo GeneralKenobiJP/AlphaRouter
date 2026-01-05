@@ -100,9 +100,15 @@ class MCTS:
         self.lookahead_length = lookahead_length
         self.embedding_dim = embedding_dim
         self.padding_dim = padding_dim
-        self.rewarder = ManhattanRewarder()
+        # self.rewarder = ManhattanRewarder()
+        self.checkpoint_period = CHECKPOINT_PERIOD
+        self.partial_rewarder = ManhattanRewarder(self.swap_options + 1)
+
+        self.qubit_embedding.to(self.device)
+        self.transformer.to(self.device)
 
     def set_root(self, state: RoutingState) -> None:
+        surpass_all_possible_gates(state)
         hash = gen_hash(state)
         node = self.get_transposition(hash)
         if node is None:
@@ -117,23 +123,28 @@ class MCTS:
                     math.log(root.visits + 1e-6) / (node.visits + 1e-6)
                 ))
 
-    def select_child(self, root: Node) -> (Node, int):
-        max_child = max(root.children.keys(), key=lambda child: self.ucb(root, child))
+    def select_child(self, root: Node, path_states: List[RoutingState] = None) -> (Node, int):
+        max_child = max(root.children.keys(),
+                        key=lambda child: -math.inf if child.state in path_states else self.ucb(root, child))
         action = root.children[max_child]
         return max_child, action
 
     def select(self, root: Node) -> (Node, bool, list[RoutingState], list[int]):
         node = root
         path_states = [root.state]
-        path_actions = [0] # dummy 0 action to make the states dim and actions dim match (root does not need any action)
+        path_actions = [0]  # dummy 0 action to make the states dim and actions dim match (root does not need any action)
 
         while not node.is_terminal():
             if node.is_exhausted(self.swap_options):
-                node, action = self.select_child(node)
+                node, action = self.select_child(node, path_states)
+                # Guard against loops
+                if node.state in path_states:
+                    return None, False, path_states, path_actions
                 path_states.append(node.state)
                 path_actions.append(action)
             else:
                 return node, False, path_states, path_actions
+
         return node, True, path_states, path_actions
 
     def get_transposition(self, hash: int) -> Optional[Node]:
@@ -145,6 +156,7 @@ class MCTS:
         self.transposition_table[hash] = node
 
     def add_child(self, parent: Node, action: int | Tensor, child_state: RoutingState) -> Node:
+        surpass_all_possible_gates(child_state)
         hash = gen_hash(child_state)
         node = self.get_transposition(hash)
         if node is None:
@@ -155,23 +167,29 @@ class MCTS:
         return node
 
     def expand(self, leaf_node: Node) -> (Node, int):
-        # actions_covered = leaf_node.children.values()
-        # actions_remaining = list(range(self.swap_options))
-        # for action in actions_remaining:
-        #     if action in actions_covered:
-        #         actions_remaining.remove(action)
+        used = set()
+        for a in leaf_node.children.values():
+            if isinstance(a, Tensor):
+                used.add(int(a.item()))
+            else:
+                used.add(int(a))
 
-        # dist = torch.distributions.Uniform(0, self.swap_options - len(actions_covered))
-        # action = torch.tensor(actions_rmaining[dist.sample()])
-        # log_prob: Tensor = dist.log_prob(action)
+        action = None
+        for a in range(self.swap_options):
+            if a not in used:
+                action = a
+                break
 
-        # dist = torch.distributions.Uniform(len(leaf_node.children.values()), self.swap_options)
-        # action = dist.sample().int()
-        action = torch.tensor(len(leaf_node.children.values()), dtype=int)
-        # log_prob: Tensor = dist.log_prob(action)
+        # action = torch.tensor(len(leaf_node.children), dtype=int)
 
         state = deepcopy(leaf_node.state)
-        state.update_state(action.item())
+        if isinstance(action, Tensor):
+            try:
+                state.update_state(action.item())
+            except Exception as e:
+                print(f'Exception: {e} caught!')
+        else:
+            state.update_state(action)
 
         node = self.add_child(leaf_node, action, state)
 
@@ -197,64 +215,100 @@ class MCTS:
         return action, log_prob
 
     def simulate(self, node: Node) -> Tensor:
-        state = deepcopy(node.state)
+        state = node.state
 
-        log_probs = []
-        rewards = []
+        embedding = embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
+                                       self.embedding_dim, self.padding_dim).to(self.device)
+        _, _, _, _, state_eval = self.transformer(embedding)
 
-        for step in range(self.max_depth):
-            if state.is_done():
-                break
 
-            embedding = embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
-                                    self.embedding_dim, self.padding_dim)
-            action, log_prob = self.get_action(embedding)
-
-            old_state = deepcopy(state)
-            state.update_state(action)
-            reward = self.rewarder.compute_reward(old_state=old_state, action=action, new_state=state)
-
-            log_probs.append(log_prob)
-            rewards.append(reward)
-
-        returns = compute_returns(rewards)
-        policy_loss = []
-        for log_prob, G_t in zip(log_probs, returns):
-            policy_loss.append(-log_prob * G_t)
-        policy_loss = torch.stack(policy_loss).sum()
-
-        return policy_loss
+        return state_eval
 
     def backpropagate(self, path_states: list[RoutingState], path_actions: list[int], reward: Tensor):
         path_states.reverse()
         path_actions.reverse()
-        for (state, action) in zip(path_states, path_actions):
+        if reward is None:
+            # Terminal node - the reward is known
+            reward = standard_reward(path_states)
+            is_terminal = True
+        else:
+            is_terminal = False
+
+        for i, (state, action) in enumerate(zip(path_states, path_actions)):
             node = self.get_transposition(gen_hash(state))
             node.visits += 1
-            node.value += reward.item()
 
-    def rollout(self):
-        leaf_node, is_terminal, path_states, path_actions = self.select(self.root)
+            idx = len(path_states) - i - 1
+
+            if idx % self.checkpoint_period == 0 and i != 0 and idx != 0:
+                node.value += self.partial_rewarder.compute_reward(old_state=path_states[i + 1], action=action,
+                                                                   new_state=state)
+                if not is_terminal:
+                    continue
+
+            if isinstance(reward, Tensor):
+                node.value += reward.item()
+            else:
+                node.value += reward
+
+    def rollout(self, root: Node):
+        leaf_node, is_terminal, path_states, path_actions = self.select(root)
+        if leaf_node is None:
+            self.add_child(self.get_transposition(gen_hash(path_states[-1])), path_actions[-1], root.state)
+            return True
         if is_terminal:
-            self.backpropagate(path_states, path_actions, leaf_node.value)
-            # returns.append(torch.tensor(leaf_node.value, device=self.device))
+            self.backpropagate(path_states, path_actions, None)
+            return False
 
         node, action = self.expand(leaf_node)
         path_states.append(node.state)
         path_actions.append(action)
 
         reward = self.simulate(node)
-
         self.backpropagate(path_states, path_actions, reward)
+        # plot_mcts_tree(self.root, mcts=self, max_nodes=10, show=True)
 
-    def run(self, root_state: RoutingState) -> int:
+        return False
+
+    def run(self, root_state: RoutingState | List[RoutingState], clear_tree: bool = False) -> (int, float, dict):
+        if clear_tree:
+            self.transposition_table = dict()
+
+        if isinstance(root_state, list):
+            root_state = root_state[0]
+
         self.set_root(root_state)
 
-        for _ in range(self.rollouts):
-            self.rollout()
+        with torch.no_grad():
+            for i in range(self.rollouts):
+                loop = self.rollout(self.root)
+                if loop:
+                    print(f'Loop detected. Rollouts truncated')
+                    break
 
-        return self.root.children[max(self.root.children.keys(), key=lambda child: child.value)]
+        # Should NOT happen
+        if len(self.root.children) == 0:
+            return 0, 1, self.transposition_table
 
+        best_action = self.root.children[
+            max(self.root.children.keys(), key=lambda child: child.value / (child.visits + 1e-6))]
+        if isinstance(best_action, Tensor):
+            best_action = best_action.item()
+
+        state_evals = [0.0] * self.swap_options
+        # print(f'len self.root.children.items() = {len(self.root.children.items())}')
+        for child_node, action in self.root.children.items():  # child_node is Node, action is int or Tensor
+            act_idx = int(action.item()) if isinstance(action, torch.Tensor) else int(action)
+            # print(f'child node value: {child_node.value}')
+            state_evals[act_idx] = child_node.value / (child_node.visits + 1e-6)
+
+        ###
+        # DEBUG
+        # print(f'state evals: {state_evals}')
+        plot_mcts_tree(self.root, mcts=self, max_nodes=10, show=True)
+        ###
+
+        return best_action, state_evals
 
 class MCTSWorker:
     def __init__(self, idx: int, qubit_embedding: nn.Embedding,
@@ -677,7 +731,7 @@ class ParallelMCTS:
 
             self.tree_queues = []
 
-    def run_parallel(self, root_states: List[RoutingState]) -> (List[int], List[float]):
+    def run(self, root_states: List[RoutingState]) -> (List[int], List[float]):
         self.transformer.eval()
 
         while self.inference_queue.qsize() > 0:
