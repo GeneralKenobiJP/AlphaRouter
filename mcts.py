@@ -33,7 +33,7 @@ TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
 TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
 TEMP_EMBEDDING_DIR = TEMP_MODEL_DIR.joinpath('temp_embedding.pt')
 
-CHECKPOINT_PERIOD = 4
+CHECKPOINT_PERIOD = 3
 
 
 def gen_hash(state: RoutingState):
@@ -229,7 +229,7 @@ class MCTS:
         path_actions.reverse()
         if reward is None:
             # Terminal node - the reward is known
-            reward = standard_reward(path_states)
+            reward = ratio_reward(path_states)
             is_terminal = True
         else:
             is_terminal = False

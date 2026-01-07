@@ -43,19 +43,19 @@ NUM_LAYERS = 4          # AR paper number of transformer layers
 D_MODEL = 216
 FFN_DIM = 4 * D_MODEL            # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 64
-MCTS_PROCESSES: int = 4
+MCTS_PROCESSES: int = 1
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 # LEARNING_RATE = 2e-5
 # LEARNING_RATE = 1e-2
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 0
 LR_DECAY_STEP = N_ENVS * 2
 LR_DECAY = 0.8
 MAX_GRAD_NORM = 5
-LOSS_COEFFICIENT = 10
+LOSS_COEFFICIENT = 100
 
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
@@ -520,7 +520,7 @@ class AlphaRouterAgent(nn.Module):
             print("Parallel MCTS Init")
             print(self.qubit_embedding.weight)
             self.qubit_embedding.cpu()
-            self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device,
+            self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device, c=5,
                                      swap_options=self.action_space_size, lookahead_length=self.lookahead_length,
                                      embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200,
                                      processes=MCTS_PROCESSES, merge_worker_trees=False)
@@ -529,7 +529,7 @@ class AlphaRouterAgent(nn.Module):
             print(self.qubit_embedding.weight)
         else:
             print("MCTS Init")
-            self.mcts = MCTS(self.transformer, self.qubit_embedding, self.device,
+            self.mcts = MCTS(self.transformer, self.qubit_embedding, self.device, c=5,
                                      swap_options=self.action_space_size, lookahead_length=self.lookahead_length,
                                      embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200)
             print("MCTS Init successful")
@@ -684,8 +684,8 @@ if __name__ == '__main__':
     print(f"cuda availability: {torch.cuda.is_available()}")
     print(f"device count: {torch.cuda.device_count()}")  # number of GPUs
     print(f"devices: {torch.cuda.get_device_name}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     print(f"device: {device}")
     path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
     print(path)
@@ -700,7 +700,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(512, batch=True)
+    model.learn(512 * 2, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 

@@ -125,12 +125,46 @@ class Transformer(nn.Module):
             TransformerLayer(d_model, num_heads, ffn_dim) for _ in range(num_layers)
         ])
 
+        # 1) Generic defaults for common modules
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Default: Glorot/Xavier uniform for linear layers (good mid-ground for transformers).
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+            elif isinstance(m, nn.LayerNorm):
+                # LayerNorm: scale=1, bias=0
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+            elif isinstance(m, nn.MultiheadAttention):
+                # MultiheadAttention stores qkv as in_proj_weight/in_proj_bias and out_proj
+                if hasattr(m, 'in_proj_weight') and m.in_proj_weight is not None:
+                    nn.init.xavier_uniform_(m.in_proj_weight)
+                if hasattr(m, 'in_proj_bias') and m.in_proj_bias is not None:
+                    nn.init.zeros_(m.in_proj_bias)
+                # out projection
+                if hasattr(m, 'out_proj') and m.out_proj is not None:
+                    nn.init.xavier_uniform_(m.out_proj.weight)
+                    if m.out_proj.bias is not None:
+                        nn.init.zeros_(m.out_proj.bias)
+
+        # 2) Override / special-case initializations
+
+        # Input projection: keep small but standard Xavier (helps stable feature magnitudes)
+        nn.init.xavier_uniform_(self.input_projection.weight)
+        if self.input_projection.bias is not None:
+            nn.init.zeros_(self.input_projection.bias)
+
         # Linear decoder that outputs the matrix of shape (number_of_logical_gates x number_of_swap_options)
         self.decoder = nn.Linear(d_model, swap_options)
+        nn.init.normal_(self.decoder.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.decoder.bias)
 
         self.value_head = nn.Linear(d_model, 1)
         self.value_head.bias.data.fill_(-5.0)
-        nn.init.uniform_(self.value_head.weight, -0.5, -1e-2)
+        nn.init.normal_(self.value_head.weight, 0.0, 1e-3)
 
         # print(f'Transformer parameters initialised to {self.state_dict()}')
 
