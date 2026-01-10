@@ -33,7 +33,7 @@ TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
 TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
 TEMP_EMBEDDING_DIR = TEMP_MODEL_DIR.joinpath('temp_embedding.pt')
 
-CHECKPOINT_PERIOD = 3
+CHECKPOINT_PERIOD = 4
 
 
 def gen_hash(state: RoutingState):
@@ -118,7 +118,7 @@ class MCTS:
             self.root = node
 
     def ucb(self, root: Node, node: Node) -> float:
-        return (node.value / (node.visits + 1 + 1e-6) +
+        return (node.value / (node.visits + 1e-6) +
                 self.c_constant * math.sqrt(
                     math.log(root.visits + 1 + 1e-6) / (node.visits + 1e-6)
                 ))
@@ -195,25 +195,6 @@ class MCTS:
 
         return node, action
 
-    def get_action(self, node_embedding) -> (Tensor, Tensor):
-        """
-        Based on the current environment state, get an action suggested by the agent
-        :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
-        :return:
-            Action - tensor of the index of the swap option (last option is no swap)
-            log_prob - tensor of log probability of the action being optimal as predicted by the model
-        """
-        with autocast(self.device.type):
-            transformer_output = self.transformer(node_embedding)
-            swap_scores = transformer_output.sum(dim=1)
-            softmax_output = torch.softmax(swap_scores, dim=-1)
-            dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
-
-            action = dist.sample()
-            log_prob: Tensor = dist.log_prob(action)
-
-        return action, log_prob
-
     def simulate(self, node: Node) -> Tensor:
         state = node.state
 
@@ -229,7 +210,7 @@ class MCTS:
         path_actions.reverse()
         if reward is None:
             # Terminal node - the reward is known
-            reward = ratio_reward(path_states)
+            reward = standard_reward(path_states)
             is_terminal = True
         else:
             is_terminal = False
@@ -240,11 +221,11 @@ class MCTS:
 
             idx = len(path_states) - i - 1
 
-            if idx % self.checkpoint_period == 0 and i != 0 and idx != 0:
-                node.value += self.partial_rewarder.compute_reward(old_state=path_states[i + 1], action=action,
-                                                                   new_state=state)
-                if not is_terminal:
-                    continue
+            # if idx % self.checkpoint_period == 0 and i != 0 and idx != 0:
+            #     node.value += self.partial_rewarder.compute_reward(old_state=path_states[i + 1], action=action,
+            #                                                        new_state=state)
+            #     if not is_terminal:
+            #         continue
 
             if isinstance(reward, Tensor):
                 node.value += reward.item()
@@ -275,7 +256,14 @@ class MCTS:
             self.transposition_table = dict()
 
         if isinstance(root_state, list):
-            root_state = root_state[0]
+            best_actions = []
+            state_evals = []
+            for state in root_state:
+                action, eval = self.run(state)
+                best_actions.append(action)
+                state_evals.append(eval)
+
+            return best_actions, state_evals
 
         self.set_root(root_state)
 
@@ -350,7 +338,7 @@ class MCTSWorker:
         self.output_queue = output_queue
 
     def ucb(self, root: Node, node: Node) -> float:
-        return (node.value / (node.visits + 1 + 1e-6) +
+        return (node.value / (node.visits + 1e-6) +
                 self.c_constant * math.sqrt(
                     math.log(root.visits + 1 + 1e-6) / (node.visits + 1e-6)
                 ))
@@ -458,7 +446,8 @@ class MCTSWorker:
             #                                                new_state=path_states[i])
             # reward = self.rewarder.compute_reward(old_state=path_states[-1], action=0, new_state=path_states[0])
             # reward = (path_states[0].position) - (len(path_actions) - 1)
-            reward = ratio_reward(path_states)
+            # reward = ratio_reward(path_states)
+            reward = standard_reward(path_states)
             is_terminal = True
         else:
             is_terminal = False
@@ -469,10 +458,10 @@ class MCTSWorker:
 
             idx = len(path_states) - i - 1
 
-            if idx % self.checkpoint_period == 0 and i != 0 and idx != 0:
-                node.value += self.partial_rewarder.compute_reward(old_state=path_states[i+1], action = action, new_state=state)
-                if not is_terminal:
-                    continue
+            # if idx % self.checkpoint_period == 0 and i != 0 and idx != 0:
+            #     node.value += self.partial_rewarder.compute_reward(old_state=path_states[i+1], action = action, new_state=state)
+            #     if not is_terminal:
+            #         continue
 
             if isinstance(reward, Tensor):
                 node.value += reward.item()
@@ -524,12 +513,13 @@ class MCTSWorker:
         if isinstance(best_action, Tensor):
             best_action = best_action.item()
 
-        state_evals = [0.0] * self.swap_options
-        # print(f'len self.root.children.items() = {len(self.root.children.items())}')
-        for child_node, action in self.root.children.items():  # child_node is Node, action is int or Tensor
-            act_idx = int(action.item()) if isinstance(action, torch.Tensor) else int(action)
-            # print(f'child node value: {child_node.value}')
-            state_evals[act_idx] = child_node.value / (child_node.visits + 1e-6)
+        # state_evals = [0.0] * self.swap_options
+        # # print(f'len self.root.children.items() = {len(self.root.children.items())}')
+        # for child_node, action in self.root.children.items():  # child_node is Node, action is int or Tensor
+        #     act_idx = int(action.item()) if isinstance(action, torch.Tensor) else int(action)
+        #     # print(f'child node value: {child_node.value}')
+        #     state_evals[act_idx] = child_node.value / (child_node.visits + 1e-6)
+        state_eval = self.root.value / (self.root.visits + 1e-6)
 
         ###
         # DEBUG
@@ -537,7 +527,7 @@ class MCTSWorker:
         plot_mcts_tree(self.root, mcts=self, max_nodes=10, show=True)
         ###
 
-        return (best_action, state_evals), self.transposition_table
+        return (best_action, state_eval), self.transposition_table
 
     def update_tree(self, master_tree: Dict):
         self.transposition_table = deepcopy(master_tree)
@@ -734,27 +724,43 @@ class ParallelMCTS:
     def run(self, root_states: List[RoutingState]) -> (List[int], List[float]):
         self.transformer.eval()
 
-        while self.inference_queue.qsize() > 0:
-            self.inference_queue.get()
+        # while self.inference_queue.qsize() > 0:
+        #     self.inference_queue.get()
 
-        queue_loop = Process(target=inference_loop,
-                             args=(self.processes, self.inference_queue, self.output_queues, self.transformer))
-        queue_loop.start()
-
-        for i in range(self.processes):
-            self.signal_queues[i].put(root_states[i])
+        # queue_loop = Process(target=inference_loop,
+        #                      args=(self.processes, self.inference_queue, self.output_queues, self.transformer))
+        # queue_loop.start()
 
         evaluated_roots = []
-        for i in range(self.processes):
-            evaluated_roots.append(self.result_queues[i].get())
 
-        # Terminate the inference queue loop
-        if queue_loop.is_alive():
-            self.inference_queue.put(None)
-            queue_loop.join()
+        for k in range((len(root_states) + self.processes - 1) // self.processes):
+            while self.inference_queue.qsize() > 0:
+                self.inference_queue.get()
+
+            queue_loop = Process(target=inference_loop,
+                                 args=(self.processes, self.inference_queue, self.output_queues, self.transformer))
+            queue_loop.start()
+
+            processes_used = self.processes
+
+            for i in range(self.processes):
+                idx = k * self.processes + i
+                if idx >= len(root_states):
+                    processes_used = i
+                    break
+                self.signal_queues[i].put(root_states[idx])
+
+            for i in range(processes_used):
+                evaluated_roots.append(self.result_queues[i].get())
+
+            # Terminate the inference queue loop
+            if queue_loop.is_alive():
+                self.inference_queue.put(None)
+                queue_loop.join()
 
         actions = [a for a, _ in evaluated_roots]
-        state_values = [np.mean(v) for _, v in evaluated_roots]
+        # state_values = [np.mean(v) for _, v in evaluated_roots]
+        state_values = [v for _, v in evaluated_roots]
 
         return actions, state_values
 

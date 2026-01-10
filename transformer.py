@@ -2,7 +2,6 @@ import math
 
 import torch
 from torch import nn, Tensor
-from torch.amp import autocast
 
 
 class PositionalEncoding(nn.Module):
@@ -40,6 +39,9 @@ class PositionalEncoding(nn.Module):
         Applies the positional encoding
         :param x: input tensor
         """
+        T = x.size(1)
+        if T > self.pe.size(0):
+            raise ValueError(f"T={T} exceeds lookahead_length={self.pe.size(0)}")
         x = x + self.pe[:x.size(1)].unsqueeze(0)
         return x
 
@@ -86,7 +88,7 @@ def choose_action(transformer_output) -> (Tensor, Tensor, Tensor, Tensor):
 
     # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
     # as we want to output the optimal swap action
-    swap_scores = transformer_output.sum(dim=1)
+    swap_scores = transformer_output.mean(dim=1)
     log_probs: Tensor = torch.log_softmax(swap_scores, dim=-1)
     # softmax_output = torch.softmax(swap_scores, dim=-1)
     # dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
