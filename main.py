@@ -23,6 +23,7 @@ import graphviz
 from torch.amp import GradScaler, autocast
 from torch.types import Device
 from torchviz import make_dot
+from typing_extensions import deprecated
 
 from custom_interaction_generator import CustomInteractionGenerator
 from mcts import ParallelMCTS, MCTS
@@ -35,27 +36,26 @@ from transformer import Transformer
 from utils import NormalizeInfoWrapper, embed_nodes, compute_returns, compute_returns_batched, boost_process_priority, \
     open_binary, get_timestamp
 
-EMBEDDING_DIM = 20      # AR paper embedding dimension
-LOOKAHEAD_LENGTH = 48   # AR paper lookahead length
-NUM_HEADS = 6           # AR paper number of heads in multihead attention
-NUM_LAYERS = 4          # AR paper number of transformer layers
-# FFN_DIM = 4 * 21            # Default hidden layer dimensionality of ffn in transformer
-D_MODEL = 216
-FFN_DIM = 4 * D_MODEL            # Default hidden layer dimensionality of ffn in transformer
-N_ENVS: int = 64
-MCTS_PROCESSES: int = 1
+EMBEDDING_DIM = 20      # AR paper embedding dimension - 20
+LOOKAHEAD_LENGTH = 48   # AR paper lookahead length - 48
+NUM_HEADS = 4           # AR paper number of heads in multihead attention - 6
+NUM_LAYERS = 3          # AR paper number of transformer layers - 4
+D_MODEL = 16            # AR paper uses 216
+FFN_DIM = 4 * D_MODEL   # Default hidden layer dimensionality of ffn in transformer
+N_ENVS: int = 32
+MCTS_PROCESSES: int = 6
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 # LEARNING_RATE = 2e-5
 # LEARNING_RATE = 1e-2
-LEARNING_RATE = 1e-5
+LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0
 LR_DECAY_STEP = N_ENVS * 2
-LR_DECAY = 0.8
+LR_DECAY = 0
 MAX_GRAD_NORM = 5
-LOSS_COEFFICIENT = 100
+LOSS_COEFFICIENT = 0.02
 
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
@@ -164,8 +164,8 @@ class ReplayBuffer:
 class AlphaRouterAgent(nn.Module):
     """The AlphaRouter routing agent"""
     def __init__(self, connection_graph: nx.Graph, interaction_generator: InteractionGenerator | None = None,
-                 device: Device = torch.device("cpu"), embedding_dim: int = 20, num_heads: int = 6, d_model: int = D_MODEL, ffn_dim: int = FFN_DIM,
-                 num_layers: int = 4, lookahead_length: int = 48, buffer_size: int = int(1e6), episode_limit: int = 150,
+                 device: Device = torch.device("cpu"), embedding_dim: int = EMBEDDING_DIM, num_heads: int = NUM_HEADS, d_model: int = D_MODEL, ffn_dim: int = FFN_DIM,
+                 num_layers: int = NUM_LAYERS, lookahead_length: int = LOOKAHEAD_LENGTH, buffer_size: int = int(1e6), episode_limit: int = 150,
                  loss_coefficient: float = LOSS_COEFFICIENT, *args, **kwargs):
         """
         :param env: Particular routing environment we want to apply the agent to
@@ -222,8 +222,8 @@ class AlphaRouterAgent(nn.Module):
         self.scaler = GradScaler(device=self.device.type)
         self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()),
                                           lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=LR_DECAY_STEP,
-                                                         gamma=LR_DECAY)
+        # self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=LR_DECAY_STEP,
+        #                                                  gamma=LR_DECAY)
 
         env_fns = [make_env(connection_graph, interaction_generator) for _ in range(N_ENVS)]
         self.vec_env = SyncVectorEnv(env_fns)
@@ -253,6 +253,7 @@ class AlphaRouterAgent(nn.Module):
 
         return action, log_prob, swap_scores
 
+    # @deprecated
     def episode(self) -> (Tensor, int, int):
         """
         Run an episode, i.e. try to solve one particular circuit
@@ -418,7 +419,7 @@ class AlphaRouterAgent(nn.Module):
         transformer_all_log_probs = torch.tensor([])
 
         if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
-            mcts_input = self.replay_buffer.sample(MCTS_PROCESSES)
+            mcts_input = self.replay_buffer.sample(N_ENVS)
             # print(f'mcts_input: {mcts_input}')
 
             # if self.device != torch.device('cpu'):
@@ -454,8 +455,8 @@ class AlphaRouterAgent(nn.Module):
             # # MSE between transformer state_values and QMCTS
             # mse_loss = torch.nn.functional.mse_loss(state_values, mcts_vals, reduction='none')  # (B,)
 
-            # transformer_actions, transformer_log_probs, transformer_state_evals = self.get_action(embeddings)
-            transformer_actions, _, transformer_state_evals, transformer_all_log_probs, state_values = self.transformer(embeddings)
+            # transformer_actions, transformer_log_probs, transformer_logits = self.get_action(embeddings)
+            transformer_actions, _, transformer_logits, transformer_all_log_probs, state_values = self.transformer(embeddings)
             # print(f'transformer_log_probs: {transformer_all_log_probs}')
             if isinstance(mcts_actions, list):
                 l1 = torch.stack([-batch_log_probs[idx] for batch_log_probs, idx in zip(transformer_all_log_probs, mcts_actions)])
@@ -485,7 +486,7 @@ class AlphaRouterAgent(nn.Module):
             # self.scaler.step(self.optimizer)
             # self.scaler.update()
             mean_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.parameters(), MAX_GRAD_NORM)
+            # torch.nn.utils.clip_grad_norm_(self.parameters(), MAX_GRAD_NORM)
             self.optimizer.step()
 
         # return policy_loss, swaps, undiscounted_returns
@@ -565,7 +566,7 @@ class AlphaRouterAgent(nn.Module):
                 losses_l2.extend(l2)
                 returns.extend(ep_return.detach().cpu())
 
-                self.scheduler.step()
+                # self.scheduler.step()
 
                 if i != 0 and (i * N_ENVS) % 512 == 0:
                     self.save_snapshot(snapshot)
@@ -700,7 +701,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(512 * 2, batch=True)
+    model.learn(512, batch=True)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
