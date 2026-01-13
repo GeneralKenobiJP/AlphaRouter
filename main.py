@@ -11,6 +11,7 @@ import networkx as nx
 import numpy as np
 import torch
 from networkx.algorithms.coloring.greedy_coloring import _Node
+from numpy import mean
 from qgym.envs import Routing
 from qgym.envs.routing import RoutingState
 import matplotlib.pyplot as plt
@@ -42,20 +43,21 @@ NUM_HEADS = 4           # AR paper number of heads in multihead attention - 6
 NUM_LAYERS = 3          # AR paper number of transformer layers - 4
 D_MODEL = 16            # AR paper uses 216
 FFN_DIM = 4 * D_MODEL   # Default hidden layer dimensionality of ffn in transformer
-N_ENVS: int = 32
-MCTS_PROCESSES: int = 6
+N_ENVS: int = 16
+BATCH_SIZE: int = 32
+MCTS_PROCESSES: int = 10
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 # LEARNING_RATE = 2e-5
 # LEARNING_RATE = 1e-2
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 2e-3
 WEIGHT_DECAY = 0
 LR_DECAY_STEP = N_ENVS * 2
 LR_DECAY = 0
 MAX_GRAD_NORM = 5
-LOSS_COEFFICIENT = 0.02
+LOSS_COEFFICIENT = 0.15
 
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
@@ -321,7 +323,7 @@ class AlphaRouterAgent(nn.Module):
 
         return policy_loss, swaps, sum(rewards)
 
-    def batch(self) -> (Tensor, list[int], Tensor):
+    def batch(self, batch_size: int = BATCH_SIZE) -> (Tensor, list[int], Tensor):
         """
         Process one batch of environments, one episode each.
         One episode means trying to solve one particular circuit.
@@ -387,7 +389,7 @@ class AlphaRouterAgent(nn.Module):
                     continue
                 if done[i]:
                     done_list[i] = True
-                    swaps[i] = step_idx
+                    swaps[i] = step_idx + 1
                     self.success_count += 1
 
             new_embeddings = torch.stack(
@@ -417,9 +419,10 @@ class AlphaRouterAgent(nn.Module):
         l1 = []
         l2 = []
         transformer_all_log_probs = torch.tensor([])
+        mean_loss = 0
 
         if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
-            mcts_input = self.replay_buffer.sample(N_ENVS)
+            mcts_input = self.replay_buffer.sample(batch_size)
             # print(f'mcts_input: {mcts_input}')
 
             # if self.device != torch.device('cpu'):
@@ -472,6 +475,12 @@ class AlphaRouterAgent(nn.Module):
             mean_loss = loss.mean()
             print(f'### mean_loss: {mean_loss}')
 
+            try:
+                l1 = l1.mean()
+                l2 = l2.mean()
+            except:
+                pass
+
             if isinstance(mcts_actions, list):
                 for state, transformer_action, mcts_action in zip(mcts_input, transformer_actions, mcts_actions):
                     print(f'### state: {state}')
@@ -490,13 +499,17 @@ class AlphaRouterAgent(nn.Module):
             self.optimizer.step()
 
         # return policy_loss, swaps, undiscounted_returns
-        if isinstance(loss, torch.Tensor):
-            loss = loss.detach().cpu()
+        if isinstance(mean_loss, torch.Tensor):
+            mean_loss = mean_loss.detach().cpu()
         if isinstance(l1, torch.Tensor):
             l1 = l1.detach().cpu()
+        elif isinstance(l1, list):
+            l1 = None
         if isinstance(l2, torch.Tensor):
             l2 = l2.detach().cpu()
-        return loss, swaps, transformer_all_log_probs, l1, l2
+        elif isinstance(l2, list):
+            l2 = None
+        return mean_loss, mean(swaps), l1, l2
 
     def save_snapshot(self, idx):
         path = TEMP_MODEL_DIR.joinpath(f"model_temp_{idx}.pt")
@@ -510,7 +523,7 @@ class AlphaRouterAgent(nn.Module):
     # def _has_passed_recurring_threshold(total_iterations, iteration, number_of_thresholds):
     #     return (iteration * number_of_thresholds / total_iterations)
 
-    def learn(self, total_timesteps: int, ma_window: int = 50, batch: bool = True) -> None:
+    def learn(self, total_timesteps: int, ma_window: int = 10, batch: bool = True, batch_size: int = BATCH_SIZE) -> None:
         """
         Conduct the learning process of the agent
         :param total_timesteps: Number of episodes during the learning process
@@ -535,8 +548,8 @@ class AlphaRouterAgent(nn.Module):
                                      embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200)
             print("MCTS Init successful")
 
-        if total_timesteps % N_ENVS != 0:
-            total_timesteps -= (total_timesteps % N_ENVS)
+        # if total_timesteps % N_ENVS != 0:
+        #     total_timesteps -= (total_timesteps % N_ENVS)
         losses = []
         swaps = []
         returns = []
@@ -557,18 +570,17 @@ class AlphaRouterAgent(nn.Module):
                     self.save_snapshot(snapshot)
                     snapshot += 1
         else:
-            for i in range(int(total_timesteps // N_ENVS)):
-                print(f"Episode: {i * N_ENVS}...")
-                loss, ep_swaps, ep_return, l1, l2 = self.batch()
-                swaps.extend(ep_swaps)
-                losses.extend(loss)
-                losses_l1.extend(l1)
-                losses_l2.extend(l2)
-                returns.extend(ep_return.detach().cpu())
+            for i in range(int(total_timesteps)):
+                print(f"Episode: {i+1}...")
+                loss, ep_swaps, l1, l2 = self.batch(batch_size=batch_size)
+                swaps.append(ep_swaps)
+                losses.append(loss)
+                losses_l1.append(l1)
+                losses_l2.append(l2)
 
                 # self.scheduler.step()
 
-                if i != 0 and (i * N_ENVS) % 512 == 0:
+                if i != 0 and i % 8 == 0:
                     self.save_snapshot(snapshot)
                     snapshot += 1
 
@@ -577,18 +589,22 @@ class AlphaRouterAgent(nn.Module):
 
         end = time.time()
 
+        print(f'loss_l1: {losses_l1}')
+        print(f'loss_l2: {losses_l2}')
+
         ma_swaps = moving_average(swaps, window=ma_window)
         ma_loss = moving_average(losses, window=ma_window)
-        ma_loss_l1 = moving_average(losses_l1, window=ma_window)
-        ma_loss_l2 = moving_average(losses_l2, window=ma_window)
+        # ma_loss_l1 = moving_average(losses_l1, window=ma_window)
+        # ma_loss_l2 = moving_average(losses_l2, window=ma_window)
         # ma_returns = moving_average(returns, window=ma_window)
 
         print(f"Success count: {self.success_count}")
-        print(f"Success %: {self.success_count / total_timesteps * 100}")
+        print(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}")
 
         path = Path(LOG_DIR.joinpath(get_timestamp() + '.txt'))
         with path.open('w', encoding='utf-8') as f:
             f.write(f'episodes: {total_timesteps}\n')
+            f.write(f'Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
             f.write(f'learning rate: {LEARNING_RATE}\n')
             f.write(f'weight decay: {WEIGHT_DECAY}\n')
             f.write(f'lr_decay: {LR_DECAY}\n')
@@ -596,27 +612,31 @@ class AlphaRouterAgent(nn.Module):
             f.write(f'loss_coefficient: {LOSS_COEFFICIENT}\n')
             f.write(f'max_grad_norm: {MAX_GRAD_NORM}\n')
             f.write(f'N_ENVS: {N_ENVS}\n')
+            f.write(f'batch_size: {BATCH_SIZE}\n')
             f.write(f'N_MCTS_WORKERS: {MCTS_PROCESSES}\n')
+            f.write(f'swaps: {swaps}\n')
             f.write(f'ma_swaps: {ma_swaps}\n')
+            f.write(f'losses: {losses}\n')
             f.write(f'ma_loss: {ma_loss}\n')
-            f.write(f'ma_loss_l1: {ma_loss_l1}\n')
-            f.write(f'ma_loss_l2: {ma_loss_l2}\n')
+            f.write(f'losses_l1: {losses_l1}\n')
+            # f.write(f'ma_loss_l1: {ma_loss_l1}\n')
+            f.write(f'losses_l2: {losses_l2}\n')
+            # f.write(f'ma_loss_l2: {ma_loss_l2}\n')
             f.write(f"Success count: {self.success_count}\n")
             f.write(f"Success %: {self.success_count / total_timesteps * 100}\n")
             f.write(f'The training took: {end - start} seconds\n')
 
         episodes = range(1, total_timesteps + 1)
-        mcts_games = range(1, len(losses) + 1)
 
         plot(episodes, swaps, label='Swaps per Episode', xlabel='Episode', ylabel='Swaps', title='Swaps per Episode')
-        plot(mcts_games, losses, label='Loss per MCTS games', xlabel='Game', ylabel='Loss', title='Loss per MCTS Games')
-        plot(mcts_games, losses_l1, label='Loss per MCTS games', xlabel='Game', ylabel='Loss', title='Loss L1 per MCTS Games')
-        plot(mcts_games, losses_l2, label='Loss per MCTS games', xlabel='Game', ylabel='Loss', title='Loss L2 per MCTS Games')
+        plot(episodes, losses, label='Loss per Episode', xlabel='Game', ylabel='Loss', title='Loss per Episode')
+        plot(episodes, losses_l1, label='Loss per Episode', xlabel='Game', ylabel='Loss', title='Loss L1 per Episode')
+        plot(episodes, losses_l2, label='Loss per Episode', xlabel='Game', ylabel='Loss', title='Loss L2 per Episode')
         # plot(episodes, returns, label=f'Returns per episode', xlabel='Episode', ylabel='Return', title='Returns per episode')
-        plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title='Swaps per episode 50-Episode MA')
-        plot(mcts_games, ma_loss, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title='Loss per MCTS games 50-Episode MA')
-        plot(mcts_games, ma_loss_l1, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title='Loss L1 per MCTS games 50-Episode MA')
-        plot(mcts_games, ma_loss_l2, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title='Loss L2 per MCTS games 50-Episode MA')
+        plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title=f'Swaps per episode {ma_window}-Episode MA')
+        plot(episodes, ma_loss, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss per Episode {ma_window}-Episode MA')
+        # plot(episodes, ma_loss_l1, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L1 per Episode {ma_window}-Episode MA')
+        # plot(episodes, ma_loss_l2, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L2 per Episode {ma_window}-Episode MA')
         # plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
 
     def forward(self, env: Routing, plot: bool = False):
@@ -701,7 +721,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(512, batch=True)
+    model.learn(200, batch=True, batch_size=BATCH_SIZE)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
