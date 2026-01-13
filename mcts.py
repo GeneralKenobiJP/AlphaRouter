@@ -23,8 +23,8 @@ from tqdm import tqdm
 from manhattan_rewarder import ManhattanRewarder
 from plotting import plot_mcts_tree
 from transformer import Transformer
-from utils import embed_nodes, compute_returns, boost_process_priority, compare_routing_states, \
-    surpass_all_possible_gates, standard_reward, ratio_reward
+from utils import embed_nodes, boost_process_priority, compare_routing_states, \
+    surpass_all_possible_gates
 
 mp.set_start_method("spawn", force=True)
 
@@ -100,7 +100,7 @@ class MCTS:
         self.lookahead_length = lookahead_length
         self.embedding_dim = embedding_dim
         self.padding_dim = padding_dim
-        # self.rewarder = ManhattanRewarder()
+        self.rewarder = BasicRewarder(illegal_action_penalty=0, penalty_per_swap=-1, reward_per_surpass=1)
         self.checkpoint_period = CHECKPOINT_PERIOD
         self.partial_rewarder = ManhattanRewarder(self.swap_options + 1)
 
@@ -200,7 +200,7 @@ class MCTS:
 
         embedding = embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
                                        self.embedding_dim, self.padding_dim).to(self.device)
-        _, _, _, _, state_eval = self.transformer(embedding)
+        _, _, _, _, state_eval = self.transformer(embedding.unsqueeze(0))
 
 
         return state_eval
@@ -210,27 +210,24 @@ class MCTS:
         path_actions.reverse()
         if reward is None:
             # Terminal node - the reward is known
-            reward = standard_reward(path_states)
-            is_terminal = True
+            reward = self.rewarder.compute_reward(old_state=path_states[1], new_state=path_states[0], action=path_actions[0])
+
+        path_states.pop(0)
+        path_actions.pop(0)
+
+        if isinstance(reward, Tensor):
+            returns = reward.item()
         else:
-            is_terminal = False
+            returns = reward
 
         for i, (state, action) in enumerate(zip(path_states, path_actions)):
             node = self.get_transposition(gen_hash(state))
             node.visits += 1
 
-            idx = len(path_states) - i - 1
+            node.value += returns
 
-            # if idx % self.checkpoint_period == 0 and i != 0 and idx != 0:
-            #     node.value += self.partial_rewarder.compute_reward(old_state=path_states[i + 1], action=action,
-            #                                                        new_state=state)
-            #     if not is_terminal:
-            #         continue
-
-            if isinstance(reward, Tensor):
-                node.value += reward.item()
-            else:
-                node.value += reward
+            if i < len(path_states) - 1:
+                returns += self.rewarder.compute_reward(old_state=path_states[i+1], new_state=path_states[i], action=action)
 
     def rollout(self, root: Node):
         leaf_node, is_terminal, path_states, path_actions = self.select(root)
@@ -283,20 +280,22 @@ class MCTS:
         if isinstance(best_action, Tensor):
             best_action = best_action.item()
 
-        state_evals = [0.0] * self.swap_options
-        # print(f'len self.root.children.items() = {len(self.root.children.items())}')
-        for child_node, action in self.root.children.items():  # child_node is Node, action is int or Tensor
-            act_idx = int(action.item()) if isinstance(action, torch.Tensor) else int(action)
-            # print(f'child node value: {child_node.value}')
-            state_evals[act_idx] = child_node.value / (child_node.visits + 1e-6)
+        # state_evals = [0.0] * self.swap_options
+        # # print(f'len self.root.children.items() = {len(self.root.children.items())}')
+        # for child_node, action in self.root.children.items():  # child_node is Node, action is int or Tensor
+        #     act_idx = int(action.item()) if isinstance(action, torch.Tensor) else int(action)
+        #     # print(f'child node value: {child_node.value}')
+        #     state_evals[act_idx] = child_node.value / (child_node.visits + 1e-6)
+
+        state_eval = self.root.value / (self.root.visits + 1e-6)
 
         ###
         # DEBUG
         # print(f'state evals: {state_evals}')
-        plot_mcts_tree(self.root, mcts=self, max_nodes=10, show=True)
+        # plot_mcts_tree(self.root, mcts=self, max_nodes=10, show=True)
         ###
 
-        return best_action, state_evals
+        return best_action, state_eval
 
 class MCTSWorker:
     def __init__(self, idx: int, qubit_embedding: nn.Embedding,
@@ -312,9 +311,7 @@ class MCTSWorker:
         self.lookahead_length = lookahead_length
         self.embedding_dim = embedding_dim
         self.padding_dim = padding_dim
-        # self.rewarder = ManhattanRewarder()
-        # NOTE: the rewarder does not do anything at the moment
-        # self.rewarder = BasicRewarder(illegal_action_penalty=0, penalty_per_swap=-1, reward_per_surpass=1)
+        self.rewarder = BasicRewarder(illegal_action_penalty=0, penalty_per_swap=-1, reward_per_surpass=1)
         self.inference_queue: mp.Queue | None = None
         self.output_queue: mp.Queue | None = None
         self.idx = idx
@@ -430,43 +427,31 @@ class MCTSWorker:
 
         return state_eval
 
-    def backpropagate(self, path_states: list[RoutingState], path_actions: list[int], reward: None | Tensor):
-        # print(f'path_states: {path_states}')
-        # print(f'path_actions: {path_actions}')
-        # print(f'reward in backprop: {reward}')
+    def backpropagate(self, path_states: list[RoutingState], path_actions: list[int], reward: None | Tensor | int):
         path_states.reverse()
         path_actions.reverse()
         if reward is None:
             # Terminal node - the reward is known
+            reward = self.rewarder.compute_reward(old_state=path_states[1], new_state=path_states[0],
+                                                  action=path_actions[0])
 
-            # for i in range(0, len(path_states)-1):
-            #     reward += self.rewarder.compute_reward(old_state=path_states[i+1], action=path_actions[i], new_state=path_states[i])
-            #     if path_states[i-1].position != path_states[i].position:
-            #         reward += self.rewarder.compute_reward(old_state=path_states[i+1], action=self.swap_options,
-            #                                                new_state=path_states[i])
-            # reward = self.rewarder.compute_reward(old_state=path_states[-1], action=0, new_state=path_states[0])
-            # reward = (path_states[0].position) - (len(path_actions) - 1)
-            # reward = ratio_reward(path_states)
-            reward = standard_reward(path_states)
-            is_terminal = True
+        path_states.pop(0)
+        path_actions.pop(0)
+
+        if isinstance(reward, Tensor):
+            returns = reward.item()
         else:
-            is_terminal = False
+            returns = reward
 
         for i, (state, action) in enumerate(zip(path_states, path_actions)):
             node = self.get_transposition(gen_hash(state))
             node.visits += 1
 
-            idx = len(path_states) - i - 1
+            node.value += returns
 
-            # if idx % self.checkpoint_period == 0 and i != 0 and idx != 0:
-            #     node.value += self.partial_rewarder.compute_reward(old_state=path_states[i+1], action = action, new_state=state)
-            #     if not is_terminal:
-            #         continue
-
-            if isinstance(reward, Tensor):
-                node.value += reward.item()
-            else:
-                node.value += reward
+            if i < len(path_states) - 1:
+                returns += self.rewarder.compute_reward(old_state=path_states[i + 1], new_state=path_states[i],
+                                                        action=action)
 
     def rollout(self, root: Node):
         leaf_node, is_terminal, path_states, path_actions = self.select(root)
@@ -497,7 +482,7 @@ class MCTSWorker:
 
         with torch.no_grad():
             for i in range(self.rollouts):
-                print(f'worker{self.idx}: rollout {i}')
+                # print(f'worker{self.idx}: rollout {i}')
                 loop = self.rollout(self.root)
                 if loop:
                     print(f'Loop detected. Rollouts truncated')
@@ -524,7 +509,7 @@ class MCTSWorker:
         ###
         # DEBUG
         # print(f'state evals: {state_evals}')
-        plot_mcts_tree(self.root, mcts=self, max_nodes=10, show=True)
+        # plot_mcts_tree(self.root, mcts=self, max_nodes=10, show=True)
         ###
 
         return (best_action, state_eval), self.transposition_table
@@ -557,7 +542,7 @@ def run_worker(worker: MCTSWorker, inference_queue: mp.Queue, output_queue: mp.Q
                 start = time.time()
                 result_queue.put(result)
                 end = time.time()
-                print(f'worker: {worker.idx} results sending took: {end - start} seconds')
+                # print(f'worker: {worker.idx} results sending took: {end - start} seconds')
                 if tree_queue is not None:
                     start = time.time()
                     tree_queue.put(tree)
@@ -734,6 +719,7 @@ class ParallelMCTS:
         evaluated_roots = []
 
         for k in range((len(root_states) + self.processes - 1) // self.processes):
+            print(f'MCTS loop iter: {k+1} / {(len(root_states) + self.processes - 1) // self.processes}...')
             while self.inference_queue.qsize() > 0:
                 self.inference_queue.get()
 
