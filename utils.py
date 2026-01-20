@@ -79,9 +79,18 @@ def embed_nodes(state: RoutingState, lookahead_length: int, device: Device, qubi
     """
     interaction_circuit = state.interaction_circuit[:lookahead_length]  # Limit lookahead depth
 
+    # w = getattr(qubit_embedding, "weight", None)
+    # print(f'qubit embedding weight: {w}')
+    # if w is not None:
+    #     try:
+    #         print(f"[weight device: {w.device}, shape: {w.shape}, sum: {float(w.sum()):.6f}")
+    #     except Exception as e:
+    #         print(f"could not inspect weight: {e}")
+
     # Pre-generate physical qubit embeddings
     phys_qubits = torch.arange(state.n_qubits, dtype=torch.long, device=device)
     embeddings = qubit_embedding(phys_qubits)
+    # print(f'Embed nodes: embeddings: {embeddings}')
 
     feature_matrix = []
     qubit_gate_dependencies: List[Set[int]] = []
@@ -109,8 +118,8 @@ def embed_nodes(state: RoutingState, lookahead_length: int, device: Device, qubi
 
         feature_matrix.append(gate_vector)
 
-    if len(feature_matrix) == 0:
-        return torch.zeros((lookahead_length, embedding_dim), device=device)
+    while len(feature_matrix) < lookahead_length:
+        feature_matrix.append(torch.zeros(embedding_dim + padding_dim + 1, device=device))
 
     return torch.stack(feature_matrix)
 
@@ -243,7 +252,7 @@ def compare_routing_states(state1: RoutingState, state2: RoutingState) -> bool:
     edges2 = set(state2.connection_graph.edges)
     if not edges1 == edges2:
         return False
-    if not np.array_equal(state1.interaction_circuit, state2.interaction_circuit):
+    if not state1.interaction_circuit[0] == state2.interaction_circuit[0]:
         return False
     if not np.array_equal(state1.mapping, state2.mapping):
         return False
@@ -275,4 +284,26 @@ def open_binary(path: Path, mode: str = 'rb', compress: Optional[str] = None):
     return open(p, mode)
 
 def get_timestamp():
-    return str(datetime.datetime.now().isoformat()).replace(':', '-')
+    return str(datetime.datetime.now().isoformat()).replace(':', '-').replace('.', '-')
+
+# def _standard_reward(gates_routed: int, path_length: int) -> int:
+#     return gates_routed - path_length
+#
+# def standard_reward(path_states: list[RoutingState]) -> int:
+#     if len(path_states) <= 1:
+#         return 0
+#
+#     new_gates_routed = path_states[0].position - path_states[-1].position
+#
+#     return _standard_reward(new_gates_routed, len(path_states) - 1)
+#
+# def _ratio_reward(gates_routed: int, path_length: int) -> float:
+#     return gates_routed / path_length
+#
+# def ratio_reward(path_states: list[RoutingState]) -> float:
+#     if len(path_states) <= 1:
+#         return 0
+#
+#     new_gates_routed = path_states[0].position - path_states[-1].position
+#
+#     return _ratio_reward(new_gates_routed, len(path_states) - 1)
