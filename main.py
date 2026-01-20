@@ -1,16 +1,14 @@
-import math
 import pickle
 import sys
 import time
 from collections import deque
 from copy import deepcopy
 from pathlib import Path
-from typing import List, Set, Union, Hashable, Any, Optional
+from typing import Union, Optional
 
 import networkx as nx
 import numpy as np
 import torch
-from networkx.algorithms.coloring.greedy_coloring import _Node
 from numpy import mean
 from qgym.envs import Routing
 from qgym.envs.routing import RoutingState
@@ -21,7 +19,7 @@ from qgym.generators.interaction import InteractionGenerator
 from torch import nn, Tensor
 
 import graphviz
-from torch.amp import GradScaler, autocast
+# from torch.amp import GradScaler, autocast
 from torch.types import Device
 from torchviz import make_dot
 from typing_extensions import deprecated
@@ -29,12 +27,11 @@ from typing_extensions import deprecated
 from custom_interaction_generator import CustomInteractionGenerator
 from mcts import ParallelMCTS, MCTS
 from plotting import moving_average, plot, plot_mapping_and_circuit
-from manhattan_rewarder import ManhattanRewarder
 
 from gymnasium.vector import SyncVectorEnv
 
-from transformer import Transformer
-from utils import NormalizeInfoWrapper, embed_nodes, compute_returns, compute_returns_batched, boost_process_priority, \
+from transformer import Transformer, choose_actions
+from utils import NormalizeInfoWrapper, embed_nodes, boost_process_priority, \
     open_binary, get_timestamp
 
 EMBEDDING_DIM = 20      # AR paper embedding dimension - 20
@@ -223,7 +220,7 @@ class AlphaRouterAgent(nn.Module):
 
         self.to(self.device)
 
-        self.scaler = GradScaler(device=self.device.type)
+        # self.scaler = GradScaler(device=self.device.type)
         self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()),
                                           lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
         # self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=LR_DECAY_STEP,
@@ -233,29 +230,6 @@ class AlphaRouterAgent(nn.Module):
         self.vec_env = SyncVectorEnv(env_fns)
 
         print('Init successful')
-
-    def get_action(self, node_embedding) -> (Tensor, Tensor, Tensor):
-        """
-        Based on the current environment state, get an action suggested by the agent
-        :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
-        :return:
-            Action - tensor of the index of the swap option (last option is no swap)
-            log_prob - tensor of log probability of the action being optimal as predicted by the model
-        """
-        with autocast(self.device.type):
-            transformer_output = self.transformer(node_embedding)
-            # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
-
-            # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
-            # as we want to output the optimal swap action
-            swap_scores = transformer_output.sum(dim=1)
-            softmax_output = torch.softmax(swap_scores, dim=-1)
-            dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
-
-            action = dist.sample()
-            log_prob: Tensor = dist.log_prob(action)
-
-        return action, log_prob, swap_scores
 
     # @deprecated
     def episode(self) -> (Tensor, int, int):
@@ -269,6 +243,7 @@ class AlphaRouterAgent(nn.Module):
         - A list of swap numbers per each environment
         - A tensor of undiscounted rewards per each environment (for plotting and analysis)
         """
+        raise Exception('Not implemented')
         # Generate a new interaction circuit
         self.env.reset()
         self.optimizer.zero_grad()
@@ -360,7 +335,9 @@ class AlphaRouterAgent(nn.Module):
         for step_idx in range(self.episode_limit):
             old_states = [deepcopy(cur_env._state) for cur_env in self.vec_env.envs]
 
-            actions, _, _, _, _ = self.transformer(state_embeddings)
+            # actions, _, _, _, _ = self.transformer(state_embeddings)
+            logits, _ = self.transformer(state_embeddings)
+            actions, _ = choose_actions(logits, sample=True)
 
             if isinstance(actions, Tensor):
                 actions = actions.cpu().numpy()
@@ -461,7 +438,8 @@ class AlphaRouterAgent(nn.Module):
             # mse_loss = torch.nn.functional.mse_loss(state_values, mcts_vals, reduction='none')  # (B,)
 
             # transformer_actions, transformer_log_probs, transformer_logits = self.get_action(embeddings)
-            transformer_actions, _, transformer_logits, transformer_all_log_probs, state_values = self.transformer(embeddings)
+            transformer_logits, state_values = self.transformer(embeddings)
+            transformer_actions, transformer_all_log_probs = choose_actions(transformer_logits, sample=False)
             # print(f'transformer_log_probs: {transformer_all_log_probs}')
             if isinstance(mcts_actions, list):
                 l1 = torch.stack([-batch_log_probs[idx] for batch_log_probs, idx in zip(transformer_all_log_probs, mcts_actions)])
@@ -488,6 +466,10 @@ class AlphaRouterAgent(nn.Module):
                 l2 = l2.mean()
             except:
                 pass
+
+            print(f'MCTS INPUT: {mcts_input}')
+            print(f'MCTS ACTIONS: {mcts_actions}')
+            print(f'TRANSFORMER ACTIONS: {transformer_actions}')
 
             if isinstance(mcts_actions, list):
                 for state, transformer_action, mcts_action in zip(mcts_input, transformer_actions, mcts_actions):
@@ -581,6 +563,13 @@ class AlphaRouterAgent(nn.Module):
             for i in range(int(total_timesteps)):
                 print(f"Episode: {i+1}...")
                 loss, ep_swaps, l1, l2 = self.batch(batch_size=batch_size)
+                if isinstance(loss, Tensor):
+                    loss = loss.item()
+                if isinstance(l1, Tensor):
+                    l1 = l1.item()
+                if isinstance(l2, Tensor):
+                    l2 = l2.item()
+
                 swaps.append(ep_swaps)
                 losses.append(loss)
                 losses_l1.append(l1)
@@ -667,7 +656,8 @@ class AlphaRouterAgent(nn.Module):
             node_embedding = embed_nodes(env._state, self.lookahead_length, self.device, self.qubit_embedding,
                         self.embedding_dim, self.padding_dim)
             node_embedding = node_embedding.unsqueeze(0)  # now shape (1, T, E)
-            transformer_action, _, _, _, _ = self.transformer(node_embedding)
+            logits, _ = self.transformer(node_embedding)
+            transformer_action, _ = self.transformer(node_embedding)
 
             if isinstance(transformer_action, Tensor):
                 transformer_action = transformer_action.cpu().item()
@@ -720,23 +710,19 @@ if __name__ == '__main__':
     device = torch.device("cpu")
     print(f"device: {device}")
     path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
-    print(path)
-
-    ### LOAD AND RESUME TRAINING OF A SPECIFIC MODEL INSTEAD OF STARTING FROM SCRATCH?
-    # model_path = MODEL_DIR.joinpath(f"model_2026-01-15T08-47-43-130974.pt")
-    # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
-    #                          device=device, episode_limit=150, loss_coefficient=LOSS_COEFFICIENT).to(device)
-    # model.load_state_dict(torch.load(model_path, weights_only=True, map_location=device))
 
     model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
-                             device=device, episode_limit=60, loss_coefficient=LOSS_COEFFICIENT,
-                             num_heads=2, num_layers=2, d_model=32, ffn_dim=8).to(device)
-    model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
+                             device=device, episode_limit=150, loss_coefficient=LOSS_COEFFICIENT).to(device)
+
+    ### LOAD AND RESUME TRAINING OF A SPECIFIC MODEL INSTEAD OF STARTING FROM SCRATCH???
+    # path = MODEL_DIR.joinpath(f"model_2026-01-15T08-47-43-130974.pt")
+    # model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
+    print(path)
 
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(200, batch=True, batch_size=BATCH_SIZE)
+    model.learn(5, batch=True, batch_size=BATCH_SIZE)
     end = time.time()
     print(f'It took: {end - start} seconds')
 

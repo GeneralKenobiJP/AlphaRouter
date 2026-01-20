@@ -1,7 +1,7 @@
 import math
 
 import torch
-from torch import nn, Tensor
+from torch import nn, Tensor, argmax
 
 
 class PositionalEncoding(nn.Module):
@@ -83,22 +83,19 @@ class TransformerLayer(nn.Module):
         return x
 
 
-def choose_action(transformer_output) -> (Tensor, Tensor, Tensor, Tensor):
+def choose_actions(logits, sample=False) -> (Tensor, Tensor, Tensor):
     # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
-
-    # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
-    # as we want to output the optimal swap action
-    swap_scores = transformer_output.mean(dim=1)
-    log_probs: Tensor = torch.log_softmax(swap_scores, dim=-1)
+    log_probs: Tensor = torch.log_softmax(logits, dim=-1)
 
     log_probs = torch.nan_to_num(log_probs, nan=-1e-9, posinf=1e9, neginf=-1e9)
 
-    dist = torch.distributions.Categorical(logits=swap_scores, validate_args=False)
+    if sample:
+        dist = torch.distributions.Categorical(logits=logits, validate_args=False)
+        actions = dist.sample()
+    else:
+        actions = argmax(log_probs, dim=-1)
 
-    action = dist.sample()
-    action_log_prob: Tensor = dist.log_prob(action)
-
-    return action, action_log_prob, swap_scores, log_probs
+    return actions, log_probs
 
 
 class Transformer(nn.Module):
@@ -188,4 +185,8 @@ class Transformer(nn.Module):
         state_values = state_values.squeeze(-1)
         state_values = state_values.mean(dim=1)
 
-        return *choose_action(output), state_values
+        # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
+        # as we want to output the optimal swap action
+        logits = output.mean(dim=1)
+
+        return logits, state_values

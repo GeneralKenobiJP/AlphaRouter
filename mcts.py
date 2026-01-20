@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from manhattan_rewarder import ManhattanRewarder
 from plotting import plot_mcts_tree
-from transformer import Transformer
+from transformer import Transformer, choose_actions
 from utils import embed_nodes, boost_process_priority, compare_routing_states, \
     surpass_all_possible_gates
 
@@ -200,7 +200,7 @@ class MCTS:
 
         embedding = embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
                                        self.embedding_dim, self.padding_dim).to(self.device)
-        _, _, _, _, state_eval = self.transformer(embedding.unsqueeze(0))
+        _, state_eval = self.transformer(embedding.unsqueeze(0))
 
 
         return state_eval
@@ -554,27 +554,6 @@ def run_worker(worker: MCTSWorker, inference_queue: mp.Queue, output_queue: mp.Q
         print(f"Worker {worker.idx} with pid {os.getpid()} died. Exception {e} caught. {e.__traceback__}")
         return
 
-
-def get_action(node_embedding, transformer: Transformer, device: Device) -> (Tensor, Tensor):
-    """
-    Based on the current environment state, get an action suggested by the agent
-    :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
-    :return:
-        Action - tensor of the index of the swap option (last option is no swap)
-        log_prob - tensor of log probability of the action being optimal as predicted by the model
-    """
-    with autocast(device.type):
-        transformer_output = transformer(node_embedding)
-        swap_scores = transformer_output.sum(dim=1)
-        softmax_output = torch.softmax(swap_scores, dim=-1)
-        dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
-
-        action = dist.sample()
-        log_prob: Tensor = dist.log_prob(action)
-
-    return action, log_prob
-
-
 def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: List[mp.Queue], transformer: Transformer):
     awaiting_states: List[Tuple[int, Embedding]] = []
     output_queues_states: List[bool] = [False] * len(output_queues)
@@ -615,7 +594,8 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
         # print(f'embeddings: {embeddings}')
         # print(f'embedding: {embedding}')
         # actions, log_probs = get_action(embedding, transformer, device)
-        actions, _, _, _, state_values = transformer(embedding)
+        logits, state_values = transformer(embedding)
+        actions, _ = choose_actions(logits, sample=True)
         # print(transformer.state_dict())
         # print(f'inferred state value: {state_values}')
 
