@@ -90,11 +90,10 @@ def choose_action(transformer_output) -> (Tensor, Tensor, Tensor, Tensor):
     # as we want to output the optimal swap action
     swap_scores = transformer_output.mean(dim=1)
     log_probs: Tensor = torch.log_softmax(swap_scores, dim=-1)
-    # softmax_output = torch.softmax(swap_scores, dim=-1)
-    # dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
+
+    log_probs = torch.nan_to_num(log_probs, nan=-1e-9, posinf=1e9, neginf=-1e9)
 
     dist = torch.distributions.Categorical(logits=swap_scores, validate_args=False)
-    # action = dist.sample()
 
     action = dist.sample()
     action_log_prob: Tensor = dist.log_prob(action)
@@ -165,7 +164,8 @@ class Transformer(nn.Module):
         nn.init.zeros_(self.decoder.bias)
 
         self.value_head = nn.Linear(d_model, 1)
-        self.value_head.bias.data.fill_(-5.0)
+        # self.value_head.bias.data.fill_(-5.0)
+        nn.init.zeros_(self.decoder.bias)
         nn.init.normal_(self.value_head.weight, 0.0, 1e-3)
 
         # print(f'Transformer parameters initialised to {self.state_dict()}')
