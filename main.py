@@ -39,24 +39,24 @@ from utils import NormalizeInfoWrapper, embed_nodes, compute_returns, compute_re
 
 EMBEDDING_DIM = 20      # AR paper embedding dimension - 20
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length - 48
-NUM_HEADS = 4           # AR paper number of heads in multihead attention - 6
-NUM_LAYERS = 3          # AR paper number of transformer layers - 4
-D_MODEL = 16            # AR paper uses 216
+NUM_HEADS = 6           # AR paper number of heads in multihead attention - 6
+NUM_LAYERS = 4          # AR paper number of transformer layers - 4
+D_MODEL = 72            # AR paper uses 216
 FFN_DIM = 4 * D_MODEL   # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 16
 BATCH_SIZE: int = 32
-MCTS_PROCESSES: int = 10
+MCTS_PROCESSES: int = 9
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
 
 # LEARNING_RATE = 2e-5
 # LEARNING_RATE = 1e-2
-LEARNING_RATE = 2e-3
+LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0
 LR_DECAY_STEP = N_ENVS * 2
 LR_DECAY = 0
-MAX_GRAD_NORM = 5
+MAX_GRAD_NORM = 1
 LOSS_COEFFICIENT = 0.15
 
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
@@ -183,6 +183,8 @@ class AlphaRouterAgent(nn.Module):
         super().__init__(*args, **kwargs)
         self.device = device
         self.env = make_env(connection_graph, interaction_generator)
+        self.n_qubits = connection_graph.number_of_nodes()
+        self.n_edges = connection_graph.number_of_edges()
         # self.env.rewarder = ManhattanRewarder()
         # self.env.rewarder = GridManhattanRewarder(5)
         self.reward = 0
@@ -470,6 +472,12 @@ class AlphaRouterAgent(nn.Module):
             l2 = (state_values - mcts_state_evals).pow(2)
             # l2 = torch.nn.functional.mse_loss(state_values, mcts_state_evals, reduction='none')
             print(f'### l2: {l2}')
+
+            self.loss_coefficient = np.sqrt((l1.detach() ** 2).sum() / (l2.detach() ** 2).sum())
+            print(f'### loss_coefficient: {self.loss_coefficient}')
+            # assert l1.requires_grad
+            # assert l2.requires_grad
+
             loss = (l1 + self.loss_coefficient * l2) / self.action_space_size
             print(f'### loss: {loss}')
             mean_loss = loss.mean()
@@ -495,7 +503,7 @@ class AlphaRouterAgent(nn.Module):
             # self.scaler.step(self.optimizer)
             # self.scaler.update()
             mean_loss.backward()
-            # torch.nn.utils.clip_grad_norm_(self.parameters(), MAX_GRAD_NORM)
+            torch.nn.utils.clip_grad_norm_(self.parameters(), MAX_GRAD_NORM)
             self.optimizer.step()
 
         # return policy_loss, swaps, undiscounted_returns
@@ -534,7 +542,7 @@ class AlphaRouterAgent(nn.Module):
             print("Parallel MCTS Init")
             print(self.qubit_embedding.weight)
             self.qubit_embedding.cpu()
-            self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device, c=5,
+            self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device, c=2,
                                      swap_options=self.action_space_size, lookahead_length=self.lookahead_length,
                                      embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200,
                                      processes=MCTS_PROCESSES, merge_worker_trees=False)
@@ -543,7 +551,7 @@ class AlphaRouterAgent(nn.Module):
             print(self.qubit_embedding.weight)
         else:
             print("MCTS Init")
-            self.mcts = MCTS(self.transformer, self.qubit_embedding, self.device, c=5,
+            self.mcts = MCTS(self.transformer, self.qubit_embedding, self.device, c=2,
                                      swap_options=self.action_space_size, lookahead_length=self.lookahead_length,
                                      embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200)
             print("MCTS Init successful")
@@ -604,7 +612,9 @@ class AlphaRouterAgent(nn.Module):
         path = Path(LOG_DIR.joinpath(get_timestamp() + '.txt'))
         with path.open('w', encoding='utf-8') as f:
             f.write(f'episodes: {total_timesteps}\n')
-            f.write(f'Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
+            f.write(f'Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}\n')
+            f.write(f'Number of qubits: {self.n_qubits}\n')
+            f.write(f'Number of edges: {self.n_edges}\n')
             f.write(f'learning rate: {LEARNING_RATE}\n')
             f.write(f'weight decay: {WEIGHT_DECAY}\n')
             f.write(f'lr_decay: {LR_DECAY}\n')
@@ -623,7 +633,7 @@ class AlphaRouterAgent(nn.Module):
             f.write(f'losses_l2: {losses_l2}\n')
             # f.write(f'ma_loss_l2: {ma_loss_l2}\n')
             f.write(f"Success count: {self.success_count}\n")
-            f.write(f"Success %: {self.success_count / total_timesteps * 100}\n")
+            f.write(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}\n")
             f.write(f'The training took: {end - start} seconds\n')
 
         episodes = range(1, total_timesteps + 1)
@@ -692,6 +702,7 @@ if __name__ == '__main__':
 
     connection_graph = nx.Graph()
     # connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
+    # connection_graph.add_edges_from([(0,1), (1,2), (2,3), (3,4)])
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
 
     connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
@@ -711,12 +722,16 @@ if __name__ == '__main__':
     path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
     print(path)
 
-    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
-                             device=device, episode_limit=150, loss_coefficient=LOSS_COEFFICIENT).to(device)
+    ### LOAD AND RESUME TRAINING OF A SPECIFIC MODEL INSTEAD OF STARTING FROM SCRATCH?
+    # model_path = MODEL_DIR.joinpath(f"model_2026-01-15T08-47-43-130974.pt")
     # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
-    #                          device=device, episode_limit=60, loss_coefficient=LOSS_COEFFICIENT,
-    #                          num_heads=2, num_layers=2, d_model=32, ffn_dim=8).to(device)
-    # model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
+    #                          device=device, episode_limit=150, loss_coefficient=LOSS_COEFFICIENT).to(device)
+    # model.load_state_dict(torch.load(model_path, weights_only=True, map_location=device))
+
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
+                             device=device, episode_limit=60, loss_coefficient=LOSS_COEFFICIENT,
+                             num_heads=2, num_layers=2, d_model=32, ffn_dim=8).to(device)
+    model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
 
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
