@@ -38,12 +38,11 @@ CHECKPOINT_PERIOD = 4
 
 def gen_hash(state: RoutingState):
     m = hashlib.sha256(usedforsecurity=False)
-    m.update(state.interaction_circuit[0].data.tobytes())
-    m.update(state.mapping.data.tobytes())
     m.update(str(state.n_qubits).encode())
     m.update(str(state.n_connections).encode())
+    m.update(state.interaction_circuit[state.position:].data.tobytes())
+    m.update(state.mapping.data.tobytes())
     return int(m.hexdigest(), 16)
-    # return hash( (state.interaction_circuit.data.tobytes(), state.mapping.data.tobytes()) )
 
 class Node:
     def __init__(self, state: RoutingState):
@@ -253,12 +252,16 @@ class MCTS:
             self.transposition_table = dict()
 
         if isinstance(root_state, list):
+            start = time.time()
             best_actions = []
             state_evals = []
-            for state in root_state:
+            for i, state in enumerate(root_state):
+                print(f"MCTS processing state: {i}/{len(root_state)}")
                 action, eval = self.run(state)
                 best_actions.append(action)
                 state_evals.append(eval)
+            end = time.time()
+            print(f"MCTS rollouts total time: {end - start}")
 
             return best_actions, state_evals
 
@@ -698,6 +701,7 @@ class ParallelMCTS:
 
         evaluated_roots = []
 
+        start = time.time()
         for k in range((len(root_states) + self.processes - 1) // self.processes):
             print(f'MCTS loop iter: {k+1} / {(len(root_states) + self.processes - 1) // self.processes}...')
             while self.inference_queue.qsize() > 0:
@@ -723,6 +727,8 @@ class ParallelMCTS:
             if queue_loop.is_alive():
                 self.inference_queue.put(None)
                 queue_loop.join()
+        end = time.time()
+        print(f'MCTS rollouts total time: {end - start} seconds')
 
         actions = [a for a, _ in evaluated_roots]
         # state_values = [np.mean(v) for _, v in evaluated_roots]
