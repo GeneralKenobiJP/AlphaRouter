@@ -36,13 +36,13 @@ from utils import NormalizeInfoWrapper, embed_nodes, boost_process_priority, \
 
 EMBEDDING_DIM = 20      # AR paper embedding dimension - 20
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length - 48
-NUM_HEADS = 6           # AR paper number of heads in multihead attention - 6
-NUM_LAYERS = 4          # AR paper number of transformer layers - 4
-D_MODEL = 72            # AR paper uses 216
+NUM_HEADS = 4           # AR paper number of heads in multihead attention - 6
+NUM_LAYERS = 3          # AR paper number of transformer layers - 4
+D_MODEL = 52            # AR paper uses 216
 FFN_DIM = 4 * D_MODEL   # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 16
 BATCH_SIZE: int = 32
-MCTS_PROCESSES: int = 9
+MCTS_PROCESSES: int = 8
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
 # REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
@@ -657,7 +657,7 @@ class AlphaRouterAgent(nn.Module):
                         self.embedding_dim, self.padding_dim)
             node_embedding = node_embedding.unsqueeze(0)  # now shape (1, T, E)
             logits, _ = self.transformer(node_embedding)
-            transformer_action, _ = self.transformer(node_embedding)
+            transformer_action, _ = choose_actions(logits)
 
             if isinstance(transformer_action, Tensor):
                 transformer_action = transformer_action.cpu().item()
@@ -712,17 +712,18 @@ if __name__ == '__main__':
     path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
 
     model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
-                             device=device, episode_limit=150, loss_coefficient=LOSS_COEFFICIENT).to(device)
+                             device=device, episode_limit=200, loss_coefficient=LOSS_COEFFICIENT).to(device)
 
     ### LOAD AND RESUME TRAINING OF A SPECIFIC MODEL INSTEAD OF STARTING FROM SCRATCH???
-    # path = MODEL_DIR.joinpath(f"model_2026-01-15T08-47-43-130974.pt")
+    # path = MODEL_DIR.joinpath(f"model_2026-01-21T00-10-47-347506.pt")
+    # path = TEMP_MODEL_DIR.joinpath(f"model_temp_18.pt")
     # model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
     print(path)
 
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(5, batch=True, batch_size=BATCH_SIZE)
+    model.learn(400, batch=True, batch_size=BATCH_SIZE)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
