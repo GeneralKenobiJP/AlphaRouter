@@ -44,8 +44,7 @@ N_ENVS: int = 16
 BATCH_SIZE: int = 32
 MCTS_PROCESSES: int = 8
 
-REPLAY_BUFFER_MIN_SIZE_MCTS: int = 320
-# REPLAY_BUFFER_MIN_SIZE_MCTS: int = 65
+REPLAY_BUFFER_MIN_SIZE_MCTS: int = 160 # AR paper uses 320
 
 # LEARNING_RATE = 2e-5
 # LEARNING_RATE = 1e-2
@@ -54,7 +53,7 @@ WEIGHT_DECAY = 0
 LR_DECAY_STEP = N_ENVS * 2
 LR_DECAY = 0
 MAX_GRAD_NORM = 1
-LOSS_COEFFICIENT = 0.15
+BUFFER_SIZE = int(1e5)
 
 MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
@@ -82,9 +81,8 @@ def make_env(connection_graph, interaction_generator: InteractionGenerator = Non
             render_mode="rgb_array",
             rewarder=rewarder,
             interaction_generator=interaction_generator
-            # interaction_generator=CustomInteractionGenerator()
         )
-        # env.seed(seed)
+
         env = NormalizeInfoWrapper(env)
         return env
     return _thunk
@@ -96,7 +94,7 @@ class ReplayBuffer:
       - stores transitions (state, action, reward, next_state, done)
       - samples minibatches of transitions as tensors
     """
-    def __init__(self, capacity: int, device: torch.device):
+    def __init__(self, capacity: int = BUFFER_SIZE, device: torch.device = torch.device("cpu")):
         """
         :param capacity: maximum number of transitions to store
         :param device:   torch.device to which sampled batches will be moved
@@ -105,20 +103,11 @@ class ReplayBuffer:
         self.device   = device
         self.buffer   = deque(maxlen=capacity)
 
-    def store(self,
-              state: RoutingState,
-              action: Union[int, torch.Tensor],
-              reward: float,
-              next_state: RoutingState,
-              done: bool):
+    def store(self, state: RoutingState):
         """
         Stores an experience.
         We detach and move everything to CPU to avoid pinning GPU memory.
         """
-        # ensure everything is on CPU and detached
-        # stored_action = (action.detach() if isinstance(action, torch.Tensor)
-        #                  else action)
-        # self.buffer.append((state, stored_action, reward, deepcopy(next_state), done))
         self.buffer.append(deepcopy(state))
 
     def sample(self, batch_size: int):
@@ -132,12 +121,6 @@ class ReplayBuffer:
         all moved to self.device.
         """
         batch = random.sample(self.buffer, batch_size)
-        # states, actions, rewards, next_states, dones = zip(*batch)
-        #
-        # states = deepcopy(states)
-        # next_states = deepcopy(next_states)
-        #
-        # return states, actions, rewards, next_states, dones
 
         return batch
 
@@ -164,8 +147,8 @@ class AlphaRouterAgent(nn.Module):
     """The AlphaRouter routing agent"""
     def __init__(self, connection_graph: nx.Graph, interaction_generator: InteractionGenerator | None = None,
                  device: Device = torch.device("cpu"), embedding_dim: int = EMBEDDING_DIM, num_heads: int = NUM_HEADS, d_model: int = D_MODEL, ffn_dim: int = FFN_DIM,
-                 num_layers: int = NUM_LAYERS, lookahead_length: int = LOOKAHEAD_LENGTH, buffer_size: int = int(1e6), episode_limit: int = 150,
-                 loss_coefficient: float = LOSS_COEFFICIENT, *args, **kwargs):
+                 num_layers: int = NUM_LAYERS, lookahead_length: int = LOOKAHEAD_LENGTH, buffer_size: int = BUFFER_SIZE, episode_limit: int = 150,
+                 test_seed: int = 42, *args, **kwargs):
         """
         :param env: Particular routing environment we want to apply the agent to
         :param device: Device to run the agent on (cuda for Nvidia graphics card, cpu for a standard cpu)
@@ -197,7 +180,6 @@ class AlphaRouterAgent(nn.Module):
         # nn.init.xavier_uniform_(self.qubit_embedding.weight)
         self.qubit_embedding.weight.share_memory_()
         print(self.qubit_embedding.weight)
-        self.loss_coefficient = loss_coefficient
         self.action_space_size = len(connection_graph.edges)
 
         embedding_dim = embedding_dim + 1  # Embedding dim + 1 for depth
@@ -213,8 +195,7 @@ class AlphaRouterAgent(nn.Module):
         self.transformer = Transformer(embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length,
                                        swap_options=self.action_space_size, device=self.device).to(self.device)
         self.replay_buffer = ReplayBuffer(
-            buffer_size,
-            self.device
+            buffer_size
         )
         self.mcts: ParallelMCTS | MCTS | None = None
 
@@ -228,6 +209,10 @@ class AlphaRouterAgent(nn.Module):
 
         env_fns = [make_env(connection_graph, interaction_generator) for _ in range(N_ENVS)]
         self.vec_env = SyncVectorEnv(env_fns)
+        self.test_vec_env = SyncVectorEnv(env_fns)
+
+        self.unfinished_indices = set(range(N_ENVS))
+        self.test_seed = test_seed
 
         print('Init successful')
 
@@ -319,107 +304,56 @@ class AlphaRouterAgent(nn.Module):
         self.vec_env.reset()
         self.optimizer.zero_grad()
 
+        print(f'### Unfinished indices: {self.unfinished_indices}')
+
         state_embeddings = torch.stack(
             [embed_nodes(cur_env._state, self.lookahead_length, self.device, self.qubit_embedding,
                               self.embedding_dim, self.padding_dim) for cur_env in self.vec_env.envs],
             dim=0
         ).to(self.device)
 
-        # print(f'Loop embeddings: {state_embeddings}')
+        logits, _ = self.transformer(state_embeddings)
+        actions, _ = choose_actions(logits)
 
-        # assert state_embeddings.shape[1] is LOOKAHEAD_LENGTH
+        if isinstance(actions, Tensor):
+            actions = actions.cpu().numpy()
 
-        done_list = [False] * N_ENVS
-        swaps = [self.episode_limit] * N_ENVS
+        observations, rewards, terminated, truncated, info = self.vec_env.step(actions)
+        done = np.logical_or(terminated, truncated)
 
-        for step_idx in range(self.episode_limit):
-            old_states = [deepcopy(cur_env._state) for cur_env in self.vec_env.envs]
+        for i in deepcopy(self.unfinished_indices):
+            if done[i]:
+                self.unfinished_indices.remove(i)
+                continue
 
-            # actions, _, _, _, _ = self.transformer(state_embeddings)
-            logits, _ = self.transformer(state_embeddings)
-            actions, _ = choose_actions(logits, sample=True)
+            env = self.vec_env.envs[i]
+            if env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position]):
+                obs, rew, ter, trun, inf = env.step(self.action_space_size)
+                done[i] = ter or trun or done[i]
 
-            if isinstance(actions, Tensor):
-                actions = actions.cpu().numpy()
+            if done[i]:
+                self.unfinished_indices.remove(i)
 
-            observations, rewards, terminated, truncated, info = self.vec_env.step(actions)
-            done = np.logical_or(terminated, truncated)
+        for i in deepcopy(self.unfinished_indices):
+            self.replay_buffer.store(self.vec_env.envs[i]._state)
 
-            # print(f'env 0 state mapping: {self.vec_env.envs[0]._state.mapping}')
-
-            # print(actions)
-            # print(old_states[0].mapping)
-            # print(self.vec_env.envs[0]._state.mapping)
-
-            for i in range(N_ENVS):
-                if done_list[i] or done[i]:
-                    continue
-                env = self.vec_env.envs[i]
-                if env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position]):
-                    obs, rew, ter, trun, inf = env.step(self.action_space_size)
-                    done[i] = ter or trun or done[i]
-
-            # observations, rewards, terminated, truncated, info = self.vec_env.step(np.full((N_ENVS,), self.action_space_size))
-            # done = np.logical_or(terminated, truncated, done)
-
-            for i in range(N_ENVS):
-                # print(self.vec_env.envs[0]._state)
-                if done_list[i]:
-                    continue
-                if done[i]:
-                    done_list[i] = True
-                    swaps[i] = step_idx + 1
-                    self.success_count += 1
-
-            new_embeddings = torch.stack(
-                [embed_nodes(env._state, self.lookahead_length, self.device, self.qubit_embedding,
-                                  self.embedding_dim, self.padding_dim) for env in self.vec_env.envs],
-                dim=0
-            ).to(self.device)
-
-            for i in range(N_ENVS):
-                if done_list[i]:
-                    # We do NOT want to run MCTS on terminal states, as it is a waste of time
-                    continue
-                self.replay_buffer.store(old_states[i], actions[i], None,
-                                         self.vec_env.envs[i]._state, done_list[i])
-            state_embeddings = new_embeddings
-            # print(f'Loop embeddings: {state_embeddings}')
-            # print(f'state: {self.vec_env.envs[0]._state}')
-
-        # backprop / gradient step
-        # self.scaler.scale(policy_loss).backward()
-        # self.scaler.step(self.optimizer)
-        # self.scaler.update()
-
-
-        # print(len(self.replay_buffer))
         loss = []
         l1 = []
         l2 = []
-        transformer_all_log_probs = torch.tensor([])
         mean_loss = 0
+
+        print(f'### Replay buffer size: {len(self.replay_buffer.buffer)}')
 
         if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
             mcts_input = self.replay_buffer.sample(batch_size)
-            # print(f'mcts_input: {mcts_input}')
-
-            # if self.device != torch.device('cpu'):
-            # torch.save(self.transformer.state_dict(), TEMP_TRANSFORMER_DIR)
             torch.save(self.qubit_embedding.state_dict(), TEMP_EMBEDDING_DIR)
-
             if MCTS_PROCESSES > 1:
                 self.transformer.cpu()
-
             mcts_actions, mcts_state_evals = self.mcts.run(mcts_input)
 
             self.transformer.train()
-
             if MCTS_PROCESSES > 1:
                 self.transformer.to(self.device)
-
-            # print(f'mcts_action: {mcts_actions}')
-            # print(f'mcts_state_evals: {mcts_state_evals}')
 
             embeddings = torch.stack(
                 [embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
@@ -427,28 +361,17 @@ class AlphaRouterAgent(nn.Module):
                 dim=0
             ).to(self.device)
 
-            # device = swap_scores.device
-            # teacher_actions = torch.tensor(mcts_actions, dtype=torch.long, device=device)  # (B,)
-            # mcts_vals = torch.tensor(mcts_state_evals, dtype=torch.float32, device=device)  # (B,)
-            #
-            # # Cross-entropy: higher stability and correct handling:
-            # ce_loss = torch.nn.functional.cross_entropy(swap_scores, teacher_actions, reduction='none')  # (B,)
-            #
-            # # MSE between transformer state_values and QMCTS
-            # mse_loss = torch.nn.functional.mse_loss(state_values, mcts_vals, reduction='none')  # (B,)
-
-            # transformer_actions, transformer_log_probs, transformer_logits = self.get_action(embeddings)
             transformer_logits, state_values = self.transformer(embeddings)
             transformer_actions, transformer_all_log_probs = choose_actions(transformer_logits, sample=False)
-            # print(f'transformer_log_probs: {transformer_all_log_probs}')
+
             if isinstance(mcts_actions, list):
                 l1 = torch.stack([-batch_log_probs[idx] for batch_log_probs, idx in zip(transformer_all_log_probs, mcts_actions)])
             else:
                 l1 = -transformer_all_log_probs[0]
             print(f'### l1: {l1}')
+
             mcts_state_evals = torch.tensor(mcts_state_evals, dtype=transformer_all_log_probs.dtype, device=transformer_all_log_probs.device)
             l2 = (state_values - mcts_state_evals).pow(2)
-            # l2 = torch.nn.functional.mse_loss(state_values, mcts_state_evals, reduction='none')
             print(f'### l2: {l2}')
 
             self.loss_coefficient = np.sqrt((l1.detach() ** 2).sum() / (l2.detach() ** 2).sum())
@@ -465,11 +388,7 @@ class AlphaRouterAgent(nn.Module):
                 l1 = l1.mean()
                 l2 = l2.mean()
             except:
-                pass
-
-            print(f'MCTS INPUT: {mcts_input}')
-            print(f'MCTS ACTIONS: {mcts_actions}')
-            print(f'TRANSFORMER ACTIONS: {transformer_actions}')
+                print('Could not compute the mean of l1 or l2')
 
             if isinstance(mcts_actions, list):
                 for state, transformer_action, mcts_action in zip(mcts_input, transformer_actions, mcts_actions):
@@ -480,6 +399,8 @@ class AlphaRouterAgent(nn.Module):
                 print(f'### state: {mcts_input[0]}')
                 print(f'### transformer_action: {transformer_actions[0]}')
                 print(f'### mcts_action: {mcts_actions}')
+
+            ### BACKPROPAGATION STEP & GRADIENT CLIPPING
 
             # self.scaler.scale(mean_loss).backward()
             # self.scaler.step(self.optimizer)
@@ -499,7 +420,64 @@ class AlphaRouterAgent(nn.Module):
             l2 = l2.detach().cpu()
         elif isinstance(l2, list):
             l2 = None
-        return mean_loss, mean(swaps), l1, l2
+
+        print()
+        return mean_loss, l1, l2
+
+    def test(self) -> (float, list[int]):
+        self.test_vec_env.reset(seed=self.test_seed)
+
+        state_embeddings = torch.stack(
+            [embed_nodes(cur_env._state, self.lookahead_length, self.device, self.qubit_embedding,
+                         self.embedding_dim, self.padding_dim) for cur_env in self.test_vec_env.envs],
+            dim=0
+        ).to(self.device)
+
+        unfinished_test_indices = set(range(N_ENVS))
+
+        swaps = [self.episode_limit] * N_ENVS
+
+        for step_idx in range(self.episode_limit):
+            logits, _ = self.transformer(state_embeddings)
+            actions, _ = choose_actions(logits)
+
+            if isinstance(actions, Tensor):
+                actions = actions.cpu().numpy()
+
+            observations, rewards, terminated, truncated, info = self.test_vec_env.step(actions)
+            done = np.logical_or(terminated, truncated)
+
+            for i in deepcopy(unfinished_test_indices):
+                if done[i]:
+                    unfinished_test_indices.remove(i)
+                    swaps[i] = step_idx + 1
+                    self.success_count += 1
+                    continue
+
+                env = self.test_vec_env.envs[i]
+                if env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position]):
+                    obs, rew, ter, trun, inf = env.step(self.action_space_size)
+                    done[i] = ter or trun or done[i]
+
+                if done[i]:
+                    unfinished_test_indices.remove(i)
+                    swaps[i] = step_idx + 1
+                    self.success_count += 1
+
+                if not unfinished_test_indices:
+                    break
+
+                state_embeddings = torch.stack(
+                    [embed_nodes(cur_env._state, self.lookahead_length, self.device, self.qubit_embedding,
+                                 self.embedding_dim, self.padding_dim) for cur_env in self.test_vec_env.envs],
+                    dim=0
+                ).to(self.device)
+
+        mean_swaps = mean(swaps)
+        print(f'### TEST SET mean_swaps: {mean_swaps}')
+        print(f'### TEST SET swaps: {swaps}')
+
+        return mean_swaps, swaps
 
     def save_snapshot(self, idx):
         path = TEMP_MODEL_DIR.joinpath(f"model_temp_{idx}.pt")
@@ -520,6 +498,8 @@ class AlphaRouterAgent(nn.Module):
         :param ma_window: The size of the moving average window used for filtering out noise in the graphs
         :batch: If true - computes in batches with B=N_ENV
         """
+        self.unfinished_indices = set(range(N_ENVS))
+
         if MCTS_PROCESSES > 1:
             print("Parallel MCTS Init")
             print(self.qubit_embedding.weight)
@@ -562,7 +542,12 @@ class AlphaRouterAgent(nn.Module):
         else:
             for i in range(int(total_timesteps)):
                 print(f"Episode: {i+1}...")
-                loss, ep_swaps, l1, l2 = self.batch(batch_size=batch_size)
+                loss, l1, l2 = self.batch(batch_size=batch_size)
+                if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
+                    ep_swaps, _ = self.test()
+                else:
+                    ep_swaps = 0.0
+
                 if isinstance(loss, Tensor):
                     loss = loss.item()
                 if isinstance(l1, Tensor):
@@ -608,7 +593,6 @@ class AlphaRouterAgent(nn.Module):
             f.write(f'weight decay: {WEIGHT_DECAY}\n')
             f.write(f'lr_decay: {LR_DECAY}\n')
             f.write(f'lr_decay_step: {LR_DECAY_STEP}\n')
-            f.write(f'loss_coefficient: {LOSS_COEFFICIENT}\n')
             f.write(f'max_grad_norm: {MAX_GRAD_NORM}\n')
             f.write(f'N_ENVS: {N_ENVS}\n')
             f.write(f'batch_size: {BATCH_SIZE}\n')
@@ -692,10 +676,10 @@ if __name__ == '__main__':
 
     connection_graph = nx.Graph()
     # connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
-    # connection_graph.add_edges_from([(0,1), (1,2), (2,3), (3,4)])
+    connection_graph.add_edges_from([(0,1), (1,2), (2,3), (3,4)])
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
 
-    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
+    # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
 
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (5,6), (6,7), (7,8), (8,9), (10,11),(11,12),(12,13), (13,14), (0,5), (5, 10), (1, 6), (6,11), (2,7), (7,12), (3,8), (8,13), (4,9), (9,14)])
     # width = 5
@@ -712,7 +696,7 @@ if __name__ == '__main__':
     path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
 
     model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
-                             device=device, episode_limit=200, loss_coefficient=LOSS_COEFFICIENT).to(device)
+                             device=device, episode_limit=100).to(device)
 
     ### LOAD AND RESUME TRAINING OF A SPECIFIC MODEL INSTEAD OF STARTING FROM SCRATCH???
     # path = MODEL_DIR.joinpath(f"model_2026-01-21T00-10-47-347506.pt")
@@ -723,7 +707,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(400, batch=True, batch_size=BATCH_SIZE)
+    model.learn(250, batch=True, batch_size=BATCH_SIZE)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
@@ -754,7 +738,7 @@ if __name__ == '__main__':
         connection_graph=connection_graph,
         render_mode="rgb_array",
         rewarder=None,
-        interaction_generator=CustomInteractionGenerator()
+        # interaction_generator=CustomInteractionGenerator()
     )
 
     ### LOAD A SPECIFIC MODEL INSTEAD OF THE LAST ONE???
@@ -769,11 +753,10 @@ if __name__ == '__main__':
     print('Model loaded successfully')
     # print(f"Model loaded: {inference_model.state_dict()}")
 
-    for i in range(10):
-        env.reset()
-        actions = inference_model(env, plot=False)
-        print('### ### ###')
-        print(f'len(actions): {len(actions)}')
-        print(f'actions: {actions}')
+    env.reset()
+    actions = inference_model(env, plot=False)
+    print('### ### ###')
+    print(f'len(actions): {len(actions)}')
+    print(f'actions: {actions}')
 
     print('Successful inference')

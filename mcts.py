@@ -595,7 +595,7 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
         # print(f'embedding: {embedding}')
         # actions, log_probs = get_action(embedding, transformer, device)
         logits, state_values = transformer(embedding)
-        actions, _ = choose_actions(logits, sample=True)
+        actions, _ = choose_actions(logits)
         # print(transformer.state_dict())
         # print(f'inferred state value: {state_values}')
 

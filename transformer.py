@@ -83,7 +83,7 @@ class TransformerLayer(nn.Module):
         return x
 
 
-def choose_actions(logits, sample=False) -> (Tensor, Tensor, Tensor):
+def choose_actions(logits, sample=True) -> (Tensor, Tensor, Tensor):
     # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
     log_probs: Tensor = torch.log_softmax(logits, dim=-1)
 
