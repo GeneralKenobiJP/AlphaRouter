@@ -10,6 +10,7 @@ from typing import List, Set, Optional
 import numpy as np
 import torch
 from gymnasium import Wrapper
+from qgym.envs import Routing
 from qgym.envs.routing import RoutingState
 from torch import nn, Tensor
 from torch.types import Device
@@ -144,7 +145,7 @@ def compare_routing_states(state1: RoutingState, state2: RoutingState) -> bool:
     edges2 = set(state2.connection_graph.edges)
     if not edges1 == edges2:
         return False
-    if not state1.interaction_circuit[0] == state2.interaction_circuit[0]:
+    if not np.array_equal(state1.interaction_circuit[state1.position:], state2.interaction_circuit[state2.position:]):
         return False
     if not np.array_equal(state1.mapping, state2.mapping):
         return False
@@ -164,6 +165,29 @@ def surpass_gate_if_possible(state: RoutingState):
 def surpass_all_possible_gates(state: RoutingState):
     while surpass_gate_if_possible(state):
         pass
+
+def env_surpass_all_possible_gates(env: Routing):
+    surpass_all_possible_gates(env._state)
+
+def env_surpass_all_possible_gates_with_info(env: Routing, surpass_action):
+    state: RoutingState = env._state
+
+    if state.is_done():
+        return None, None, True, None
+
+    obs = None
+    rew = None
+    done = False
+    info = None
+
+    while state.is_legal_surpass(*state.interaction_circuit[state.position]):
+        obs, rew, ter, trun, inf = env.step(surpass_action)
+        done = ter or trun
+        if done:
+            return obs, rew, done, inf
+
+    return obs, rew, done, info
+
 
 def open_binary(path: Path, mode: str = 'rb', compress: Optional[str] = None):
     p = str(path)

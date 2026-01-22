@@ -32,7 +32,7 @@ from gymnasium.vector import SyncVectorEnv
 
 from transformer import Transformer, choose_actions
 from utils import NormalizeInfoWrapper, embed_nodes, boost_process_priority, \
-    open_binary, get_timestamp
+    open_binary, get_timestamp, env_surpass_all_possible_gates, env_surpass_all_possible_gates_with_info
 
 EMBEDDING_DIM = 20      # AR paper embedding dimension - 20
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length - 48
@@ -42,7 +42,7 @@ D_MODEL = 52            # AR paper uses 216
 FFN_DIM = 4 * D_MODEL   # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 16
 BATCH_SIZE: int = 32
-MCTS_PROCESSES: int = 8
+MCTS_PROCESSES: int = 1
 
 REPLAY_BUFFER_MIN_SIZE_MCTS: int = 160 # AR paper uses 320
 
@@ -301,7 +301,6 @@ class AlphaRouterAgent(nn.Module):
         - A tensor of undiscounted rewards per each environment (for plotting and analysis)
         """
         self.transformer.train()
-        self.vec_env.reset()
         self.optimizer.zero_grad()
 
         print(f'### Unfinished indices: {self.unfinished_indices}')
@@ -327,9 +326,7 @@ class AlphaRouterAgent(nn.Module):
                 continue
 
             env = self.vec_env.envs[i]
-            if env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position]):
-                obs, rew, ter, trun, inf = env.step(self.action_space_size)
-                done[i] = ter or trun or done[i]
+            obs, rew, done[i], info = env_surpass_all_possible_gates_with_info(env, self.action_space_size)
 
             if done[i]:
                 self.unfinished_indices.remove(i)
@@ -455,9 +452,7 @@ class AlphaRouterAgent(nn.Module):
                     continue
 
                 env = self.test_vec_env.envs[i]
-                if env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position]):
-                    obs, rew, ter, trun, inf = env.step(self.action_space_size)
-                    done[i] = ter or trun or done[i]
+                obs, rew, done[i], info = env_surpass_all_possible_gates_with_info(env, self.action_space_size)
 
                 if done[i]:
                     unfinished_test_indices.remove(i)
@@ -499,6 +494,15 @@ class AlphaRouterAgent(nn.Module):
         :batch: If true - computes in batches with B=N_ENV
         """
         self.unfinished_indices = set(range(N_ENVS))
+        self.vec_env.reset()
+
+        for env in self.vec_env.envs:
+            env_surpass_all_possible_gates(env)
+            while env._state.is_done():
+                env.reset()
+                env_surpass_all_possible_gates(env)
+
+            self.replay_buffer.store(env._state)
 
         if MCTS_PROCESSES > 1:
             print("Parallel MCTS Init")
@@ -654,11 +658,13 @@ class AlphaRouterAgent(nn.Module):
             # print(f'env._state.interaction_circuit[env._state.position]: {env._state.interaction_circuit[env._state.position]}')
             # print(f'is_legal_surpass: {env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position])}')
 
-            if env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position]):
+            while env._state.is_legal_surpass(*env._state.interaction_circuit[env._state.position]):
                 observation, reward, done, truncated, info = env.step(self.action_space_size)
                 if plot:
                     plot_mapping_and_circuit(env._state.connection_graph, env._state.mapping,
                                          env._state.interaction_circuit)
+                if done:
+                    break
                 # print('gate ahead, cap\'n!')
 
             if done:
@@ -695,7 +701,7 @@ if __name__ == '__main__':
     print(f"device: {device}")
     path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
 
-    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=None,
                              device=device, episode_limit=100).to(device)
 
     ### LOAD AND RESUME TRAINING OF A SPECIFIC MODEL INSTEAD OF STARTING FROM SCRATCH???
