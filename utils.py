@@ -59,6 +59,12 @@ class NormalizeInfoWrapper(Wrapper):
         # .env should exist because Wrapper provides it
         return getattr(self.env, '_state')
 
+    @_state.setter
+    def _state(self, value):
+        # delegate to inner env
+        # .env should exist because Wrapper provides it
+        setattr(self.env, '_state', value)
+
 
 def embed_nodes(state: RoutingState, lookahead_length: int, device: Device, qubit_embedding: nn.Embedding,
                 embedding_dim: int, padding_dim: int):

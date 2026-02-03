@@ -19,6 +19,19 @@ def plot(x_axis, values, label, xlabel, ylabel, title):
     plt.tight_layout()
     plt.show()
 
+def plot_subplots(x_axis, values_lists, labels, xlabel, ylabel, title):
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    for values, label in zip(values_lists, labels):
+        ax.plot(x_axis, values, label=label, linewidth=2)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    plt.show()
+
 def moving_average(values, window):
     ma_values = []
 

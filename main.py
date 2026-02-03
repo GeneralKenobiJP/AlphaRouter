@@ -22,11 +22,13 @@ import graphviz
 # from torch.amp import GradScaler, autocast
 from torch.types import Device
 from torchviz import make_dot
+from tqdm import tqdm
 from typing_extensions import deprecated
 
+from benchmark import benchmark
 from custom_interaction_generator import CustomInteractionGenerator
 from mcts import ParallelMCTS, MCTS
-from plotting import moving_average, plot, plot_mapping_and_circuit
+from plotting import moving_average, plot, plot_mapping_and_circuit, plot_subplots
 
 from gymnasium.vector import SyncVectorEnv
 
@@ -38,7 +40,7 @@ EMBEDDING_DIM = 20      # AR paper embedding dimension - 20
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length - 48
 NUM_HEADS = 4           # AR paper number of heads in multihead attention - 6
 NUM_LAYERS = 3          # AR paper number of transformer layers - 4
-D_MODEL = 52            # AR paper uses 216
+D_MODEL = 56            # AR paper uses 216
 FFN_DIM = 4 * D_MODEL   # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 16
 BATCH_SIZE: int = 32
@@ -213,8 +215,14 @@ class AlphaRouterAgent(nn.Module):
 
         self.unfinished_indices = set(range(N_ENVS))
         self.test_seed = test_seed
+        self.test_vec_env.reset(seed=self.test_seed)
+        self.test_states_backup = [deepcopy(env._state) for env in self.test_vec_env.envs]
 
         print('Init successful')
+
+    def _reset_test_envs(self):
+        for i in range(len(self.test_vec_env.envs)):
+            self.test_vec_env.envs[i]._state = deepcopy(self.test_states_backup[i])
 
     # @deprecated
     def episode(self) -> (Tensor, int, int):
@@ -422,7 +430,9 @@ class AlphaRouterAgent(nn.Module):
         return mean_loss, l1, l2
 
     def test(self) -> (float, list[int]):
-        self.test_vec_env.reset(seed=self.test_seed)
+        # self.test_vec_env.reset(seed=self.test_seed)
+        # self.test_vec_env.reset()
+        self._reset_test_envs()
 
         state_embeddings = torch.stack(
             [embed_nodes(cur_env._state, self.lookahead_length, self.device, self.qubit_embedding,
@@ -473,6 +483,22 @@ class AlphaRouterAgent(nn.Module):
         print(f'### TEST SET swaps: {swaps}')
 
         return mean_swaps, swaps
+
+    def benchmark(self, backend: str = 'SABRE') -> tuple[float, list[int]]:
+        # self.test_vec_env.reset(seed=self.test_seed)
+        self._reset_test_envs()
+
+        swaps = []
+
+        for env in self.test_vec_env.envs:
+            swaps.append(benchmark(env, seed=None, backend=backend, show_circuits=True))
+
+        mean_swaps = mean(swaps)
+        print(f'### BENCHMARK mean_swaps: {mean_swaps}')
+        print(f'### BENCHMARK swaps: {swaps}')
+
+        return mean_swaps, swaps
+
 
     def save_snapshot(self, idx):
         path = TEMP_MODEL_DIR.joinpath(f"model_temp_{idx}.pt")
@@ -526,10 +552,15 @@ class AlphaRouterAgent(nn.Module):
         #     total_timesteps -= (total_timesteps % N_ENVS)
         losses = []
         swaps = []
+        swap_lists = []
+        benchmark_swaps = 0
+        benchmark_swap_list = []
         returns = []
         losses_l1 = []
         losses_l2 = []
         snapshot = 0
+
+        benchmark_swaps, benchmark_swap_list = self.benchmark(backend='SABRE')
 
         start = time.time()
 
@@ -544,13 +575,17 @@ class AlphaRouterAgent(nn.Module):
                     self.save_snapshot(snapshot)
                     snapshot += 1
         else:
-            for i in range(int(total_timesteps)):
-                print(f"Episode: {i+1}...")
+            for i in tqdm(range(int(total_timesteps))):
+                print(f"\n\nEpisode: {i+1}...")
                 loss, l1, l2 = self.batch(batch_size=batch_size)
                 if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
-                    ep_swaps, _ = self.test()
+                    ep_swaps, ep_swap_list = self.test()
                 else:
                     ep_swaps = 0.0
+                    ep_swap_list = []
+
+                print(f'### BENCHMARK mean_swaps: {benchmark_swaps}')
+                print(f'### BENCHMARK swaps: {benchmark_swap_list}')
 
                 if isinstance(loss, Tensor):
                     loss = loss.item()
@@ -560,6 +595,7 @@ class AlphaRouterAgent(nn.Module):
                     l2 = l2.item()
 
                 swaps.append(ep_swaps)
+                swap_lists.append(ep_swap_list)
                 losses.append(loss)
                 losses_l1.append(l1)
                 losses_l2.append(l2)
@@ -603,12 +639,15 @@ class AlphaRouterAgent(nn.Module):
             f.write(f'N_MCTS_WORKERS: {MCTS_PROCESSES}\n')
             f.write(f'swaps: {swaps}\n')
             f.write(f'ma_swaps: {ma_swaps}\n')
+            f.write(f'benchmark_swaps: {benchmark_swaps}\n')
             f.write(f'losses: {losses}\n')
             f.write(f'ma_loss: {ma_loss}\n')
             f.write(f'losses_l1: {losses_l1}\n')
             # f.write(f'ma_loss_l1: {ma_loss_l1}\n')
             f.write(f'losses_l2: {losses_l2}\n')
             # f.write(f'ma_loss_l2: {ma_loss_l2}\n')
+            f.write(f'swap_lists: {swap_lists}\n')
+            f.write(f'benchmark_swap_lists: {swap_lists}\n')
             f.write(f"Success count: {self.success_count}\n")
             f.write(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}\n")
             f.write(f'The training took: {end - start} seconds\n')
@@ -620,8 +659,12 @@ class AlphaRouterAgent(nn.Module):
         plot(episodes, losses_l1, label='Loss per Episode', xlabel='Game', ylabel='Loss', title='Loss L1 per Episode')
         plot(episodes, losses_l2, label='Loss per Episode', xlabel='Game', ylabel='Loss', title='Loss L2 per Episode')
         # plot(episodes, returns, label=f'Returns per episode', xlabel='Episode', ylabel='Return', title='Returns per episode')
-        plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title=f'Swaps per episode {ma_window}-Episode MA')
+        # plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title=f'Swaps per episode {ma_window}-Episode MA')
         plot(episodes, ma_loss, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss per Episode {ma_window}-Episode MA')
+
+        circuits = range(N_ENVS)
+
+        plot_subplots(circuits, [swap_lists[-1], benchmark_swap_list], labels=['AlphaRouter (final agent)', 'SABRE'], xlabel='Circuit', ylabel='Swaps', title='Swaps per Circuit')
         # plot(episodes, ma_loss_l1, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L1 per Episode {ma_window}-Episode MA')
         # plot(episodes, ma_loss_l2, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L2 per Episode {ma_window}-Episode MA')
         # plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
@@ -686,6 +729,7 @@ if __name__ == '__main__':
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
 
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
+    # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7), (7,8), (8,9)])
 
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (5,6), (6,7), (7,8), (8,9), (10,11),(11,12),(12,13), (13,14), (0,5), (5, 10), (1, 6), (6,11), (2,7), (7,12), (3,8), (8,13), (4,9), (9,14)])
     # width = 5
@@ -713,7 +757,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(250, batch=True, batch_size=BATCH_SIZE)
+    model.learn(25, batch=True, batch_size=BATCH_SIZE)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
@@ -744,7 +788,7 @@ if __name__ == '__main__':
         connection_graph=connection_graph,
         render_mode="rgb_array",
         rewarder=None,
-        # interaction_generator=CustomInteractionGenerator()
+        interaction_generator=CustomInteractionGenerator()
     )
 
     ### LOAD A SPECIFIC MODEL INSTEAD OF THE LAST ONE???

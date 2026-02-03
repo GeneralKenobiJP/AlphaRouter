@@ -31,11 +31,13 @@ def _env_to_circuit(env: Env, num_qubits) -> QuantumCircuit:
 
     return qc
 
-def run_benchmark(env: Env, seed: int = 42, backend: str = 'SABRE', pass_manager: PassManager = None) -> tuple[QuantumCircuit, QuantumCircuit]:
+def run_benchmark(env: Env, seed: int | None = 42, backend: str = 'SABRE', pass_manager: PassManager = None) -> tuple[QuantumCircuit, QuantumCircuit]:
     if pass_manager is None:
         pass_manager = PassManager()
 
-    env.reset(seed=seed)
+    if seed is not None:
+        env.reset(seed=seed)
+
     coupling_map, num_qubits = _env_to_coupling_map(env)
 
     initial_layout = list(range(num_qubits))
@@ -55,7 +57,7 @@ def run_benchmark(env: Env, seed: int = 42, backend: str = 'SABRE', pass_manager
 
     return circuit, pass_manager.run(circuit)
 
-def benchmark(env: Env, seed: int = 42, backend: str = 'SABRE', show_circuits: bool = False) -> int:
+def benchmark(env: Env, seed: int | None = 42, backend: str = 'SABRE', show_circuits: bool = False) -> int:
     initial_circuit, routed_circuit = run_benchmark(env, seed=seed, backend=backend)
 
     routed_ops = routed_circuit.count_ops()
