@@ -655,12 +655,12 @@ class AlphaRouterAgent(nn.Module):
         episodes = range(1, total_timesteps + 1)
 
         plot(episodes, swaps, label='Swaps per Episode', xlabel='Episode', ylabel='Swaps', title='Swaps per Episode')
-        plot(episodes, losses, label='Loss per Episode', xlabel='Game', ylabel='Loss', title='Loss per Episode')
-        plot(episodes, losses_l1, label='Loss per Episode', xlabel='Game', ylabel='Loss', title='Loss L1 per Episode')
-        plot(episodes, losses_l2, label='Loss per Episode', xlabel='Game', ylabel='Loss', title='Loss L2 per Episode')
+        plot(episodes, losses, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss per Episode')
+        plot(episodes, losses_l1, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss L1 per Episode')
+        plot(episodes, losses_l2, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss L2 per Episode')
         # plot(episodes, returns, label=f'Returns per episode', xlabel='Episode', ylabel='Return', title='Returns per episode')
-        # plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title=f'Swaps per episode {ma_window}-Episode MA')
-        plot(episodes, ma_loss, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss per Episode {ma_window}-Episode MA')
+        plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title=f'Swaps per episode {ma_window}-Episode MA')
+        plot(episodes, ma_loss, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Loss', title=f'Loss per Episode {ma_window}-Episode MA')
 
         circuits = range(N_ENVS)
 
@@ -757,7 +757,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(25, batch=True, batch_size=BATCH_SIZE)
+    model.learn(4500, batch=True, batch_size=BATCH_SIZE)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
