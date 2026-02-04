@@ -64,11 +64,16 @@ TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
 TEMP_EMBEDDING_DIR = TEMP_MODEL_DIR.joinpath('temp_embedding.pt')
 LOG_DIR = Path(__file__).resolve().parent.joinpath('logs/')
 
-def render_rgb(env):
+def render_rgb(env, title=None):
     """Convenience method that we will use later on to display our results. Copied from notebooks"""
+    if title is None:
+        title = f"Step {env._state.steps_done}"
     plt.figure(figsize=(40, 20))
-    plt.title(f"Step {env._state.steps_done}", fontsize=40)
-    plt.imshow(env.render())
+    plt.title(title, fontsize=40)
+    try:
+        plt.imshow(env.render())
+    except IndexError:
+        plt.imshow(env.render())
     plt.axis("off")
     plt.show()
 
@@ -623,6 +628,9 @@ class AlphaRouterAgent(nn.Module):
         print(f"Success count: {self.success_count}")
         print(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}")
 
+        self._reset_test_envs()
+        test_circuits = [env._state.interaction_circuit for env in self.test_vec_env.envs]
+
         path = Path(LOG_DIR.joinpath(get_timestamp() + '.txt'))
         with path.open('w', encoding='utf-8') as f:
             f.write(f'episodes: {total_timesteps}\n')
@@ -648,6 +656,7 @@ class AlphaRouterAgent(nn.Module):
             # f.write(f'ma_loss_l2: {ma_loss_l2}\n')
             f.write(f'swap_lists: {swap_lists}\n')
             f.write(f'benchmark_swap_lists: {swap_lists}\n')
+            f.write(f'Test circuits: {test_circuits}')
             f.write(f"Success count: {self.success_count}\n")
             f.write(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}\n")
             f.write(f'The training took: {end - start} seconds\n')
@@ -665,6 +674,9 @@ class AlphaRouterAgent(nn.Module):
         circuits = range(N_ENVS)
 
         plot_subplots(circuits, [swap_lists[-1], benchmark_swap_list], labels=['AlphaRouter (final agent)', 'SABRE'], xlabel='Circuit', ylabel='Swaps', title='Swaps per Circuit')
+
+        for i, env in enumerate(self.test_vec_env.envs):
+            render_rgb(env, title=f'Test circuit #{i}')
         # plot(episodes, ma_loss_l1, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L1 per Episode {ma_window}-Episode MA')
         # plot(episodes, ma_loss_l2, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L2 per Episode {ma_window}-Episode MA')
         # plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
@@ -757,7 +769,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(4500, batch=True, batch_size=BATCH_SIZE)
+    model.learn(15, batch=True, batch_size=BATCH_SIZE)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
@@ -795,11 +807,8 @@ if __name__ == '__main__':
     # path = MODEL_DIR.joinpath(f"model_1028_far_gate_patched_qgym_paper_hyper_2-2025-12-04T11-27-24-601885.pt")
 
     inference_model = AlphaRouterAgent(connection_graph=connection_graph, device=device, episode_limit=90).to(device)
-    # inference_model = AlphaRouterAgent(connection_graph=connection_graph, device=device, episode_limit=90,
-    #                                    num_heads=2, num_layers=2, d_model=32, ffn_dim=8).to(device)
     inference_model.load_state_dict(torch.load(path, weights_only=True))
     inference_model.eval()
-    # inference_model.train()
     print('Model loaded successfully')
     # print(f"Model loaded: {inference_model.state_dict()}")
 
