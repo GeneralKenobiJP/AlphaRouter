@@ -457,3 +457,17 @@ def plot_mcts_tree(
     if show:
         plt.show()
     return fig
+
+
+def render_rgb(env, title=None):
+    """Convenience method that we will use later on to display our results. Copied from notebooks"""
+    if title is None:
+        title = f"Step {env._state.steps_done}"
+    plt.figure(figsize=(40, 20))
+    plt.title(title, fontsize=40)
+    try:
+        plt.imshow(env.render())
+    except IndexError:
+        plt.imshow(env.render())
+    plt.axis("off")
+    plt.show()

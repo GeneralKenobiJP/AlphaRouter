@@ -4,7 +4,7 @@ import time
 from collections import deque
 from copy import deepcopy
 from pathlib import Path
-from typing import Union, Optional
+from typing import Optional
 
 import networkx as nx
 import numpy as np
@@ -15,20 +15,18 @@ from qgym.envs.routing import RoutingState
 import matplotlib.pyplot as plt
 import random
 
+from qgym.generators import BasicInteractionGenerator
 from qgym.generators.interaction import InteractionGenerator
 from torch import nn, Tensor
 
-import graphviz
 # from torch.amp import GradScaler, autocast
 from torch.types import Device
-from torchviz import make_dot
 from tqdm import tqdm
-from typing_extensions import deprecated
 
 from benchmark import benchmark
 from custom_interaction_generator import CustomInteractionGenerator
 from mcts import ParallelMCTS, MCTS
-from plotting import moving_average, plot, plot_mapping_and_circuit, plot_subplots
+from plotting import moving_average, plot, plot_mapping_and_circuit, plot_subplots, render_rgb
 
 from gymnasium.vector import SyncVectorEnv
 
@@ -42,7 +40,7 @@ NUM_HEADS = 4           # AR paper number of heads in multihead attention - 6
 NUM_LAYERS = 3          # AR paper number of transformer layers - 4
 D_MODEL = 56            # AR paper uses 216
 FFN_DIM = 4 * D_MODEL   # Default hidden layer dimensionality of ffn in transformer
-N_ENVS: int = 16
+N_ENVS: int = 32
 BATCH_SIZE: int = 32
 MCTS_PROCESSES: int = 1
 
@@ -63,19 +61,6 @@ TEMP_BUFFER_DIR = TEMP_MODEL_DIR.joinpath('buffers/')
 TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
 TEMP_EMBEDDING_DIR = TEMP_MODEL_DIR.joinpath('temp_embedding.pt')
 LOG_DIR = Path(__file__).resolve().parent.joinpath('logs/')
-
-def render_rgb(env, title=None):
-    """Convenience method that we will use later on to display our results. Copied from notebooks"""
-    if title is None:
-        title = f"Step {env._state.steps_done}"
-    plt.figure(figsize=(40, 20))
-    plt.title(title, fontsize=40)
-    try:
-        plt.imshow(env.render())
-    except IndexError:
-        plt.imshow(env.render())
-    plt.axis("off")
-    plt.show()
 
 
 def make_env(connection_graph, interaction_generator: InteractionGenerator = None, rewarder=None):
@@ -412,6 +397,8 @@ class AlphaRouterAgent(nn.Module):
 
             ### BACKPROPAGATION STEP & GRADIENT CLIPPING
 
+            print(f'Backpropagation step...')
+
             # self.scaler.scale(mean_loss).backward()
             # self.scaler.step(self.optimizer)
             # self.scaler.update()
@@ -565,6 +552,8 @@ class AlphaRouterAgent(nn.Module):
         losses_l2 = []
         snapshot = 0
 
+        print(f'### BENCHMARKING THE TEST CIRCUITS')
+
         benchmark_swaps, benchmark_swap_list = self.benchmark(backend='SABRE')
 
         start = time.time()
@@ -584,6 +573,7 @@ class AlphaRouterAgent(nn.Module):
                 print(f"\n\nEpisode: {i+1}...")
                 loss, l1, l2 = self.batch(batch_size=batch_size)
                 if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
+                    print(f'Running the test set (Episode: {i+1})...')
                     ep_swaps, ep_swap_list = self.test()
                 else:
                     ep_swaps = 0.0
@@ -655,7 +645,7 @@ class AlphaRouterAgent(nn.Module):
             f.write(f'losses_l2: {losses_l2}\n')
             # f.write(f'ma_loss_l2: {ma_loss_l2}\n')
             f.write(f'swap_lists: {swap_lists}\n')
-            f.write(f'benchmark_swap_lists: {swap_lists}\n')
+            f.write(f'benchmark_swap_lists: {benchmark_swap_list}\n')
             f.write(f'Test circuits: {test_circuits}')
             f.write(f"Success count: {self.success_count}\n")
             f.write(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}\n")
@@ -736,8 +726,8 @@ if __name__ == '__main__':
     boost_process_priority()
 
     connection_graph = nx.Graph()
-    # connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
-    connection_graph.add_edges_from([(0,1), (1,2), (2,3), (3,4)])
+    connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
+    # connection_graph.add_edges_from([(0,1), (1,2), (2,3), (3,4)])
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
 
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
@@ -757,7 +747,7 @@ if __name__ == '__main__':
     print(f"device: {device}")
     path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
 
-    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=None,
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=BasicInteractionGenerator(max_length=30),
                              device=device, episode_limit=100).to(device)
 
     ### LOAD AND RESUME TRAINING OF A SPECIFIC MODEL INSTEAD OF STARTING FROM SCRATCH???
@@ -769,7 +759,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(15, batch=True, batch_size=BATCH_SIZE)
+    model.learn(5, batch=True, batch_size=BATCH_SIZE)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
