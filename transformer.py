@@ -21,18 +21,11 @@ class PositionalEncoding(nn.Module):
             torch.arange(0, embedding_dim, 2, dtype=torch.float32) * (-math.log(1e5) / embedding_dim))  # (d/2,)
         pe = torch.zeros(lookahead_length, embedding_dim)
         pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
 
-        # position = torch.arange(lookahead_length, dtype=torch.float32).unsqueeze(1)
-        # div_term = torch.exp(torch.arange(0, embedding_dim, 2, dtype=torch.float32) * (-math.log(1e5) / embedding_dim))
-        # pe = torch.zeros(lookahead_length, embedding_dim)
-        # pe[:, 0::2] = torch.sin(position * div_term)
-        #
-        # # Rounded up to the nearest even number so that odd indices slicing works
-        # final_embedding_dim_even = embedding_dim if embedding_dim % 2 == 0 else embedding_dim - 1
-        # pe[:, 1::2] = torch.cos(position * div_term[::final_embedding_dim_even])
-        # self.register_buffer('pe', pe)
+        odd_cols = pe[:, 1::2].shape[1]
+        if odd_cols > 0:
+            pe[:, 1::2] = torch.cos(position * div_term[:odd_cols])
+        self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
