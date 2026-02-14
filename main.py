@@ -22,6 +22,7 @@ from torch import nn, Tensor
 # from torch.amp import GradScaler, autocast
 from torch.types import Device
 from tqdm import tqdm
+from transformers import get_linear_schedule_with_warmup
 
 from benchmark import benchmark
 from custom_interaction_generator import CustomInteractionGenerator
@@ -38,7 +39,7 @@ EMBEDDING_DIM = 20      # AR paper embedding dimension - 20
 LOOKAHEAD_LENGTH = 48   # AR paper lookahead length - 48
 NUM_HEADS = 4           # AR paper number of heads in multihead attention - 6
 NUM_LAYERS = 3          # AR paper number of transformer layers - 4
-D_MODEL = 56            # AR paper uses 216
+D_MODEL = 32            # AR paper uses 216
 FFN_DIM = 4 * D_MODEL   # Default hidden layer dimensionality of ffn in transformer
 N_ENVS: int = 32
 BATCH_SIZE: int = 32
@@ -50,8 +51,8 @@ REPLAY_BUFFER_MIN_SIZE_MCTS: int = 160 # AR paper uses 320
 # LEARNING_RATE = 1e-2
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0
-LR_DECAY_STEP = N_ENVS * 2
-LR_DECAY = 0
+LR_DECAY_STEP = 40
+LR_DECAY = 1
 MAX_GRAD_NORM = 1
 BUFFER_SIZE = int(1e5)
 
@@ -139,8 +140,9 @@ class AlphaRouterAgent(nn.Module):
     """The AlphaRouter routing agent"""
     def __init__(self, connection_graph: nx.Graph, interaction_generator: InteractionGenerator | None = None,
                  device: Device = torch.device("cpu"), embedding_dim: int = EMBEDDING_DIM, num_heads: int = NUM_HEADS, d_model: int = D_MODEL, ffn_dim: int = FFN_DIM,
-                 num_layers: int = NUM_LAYERS, lookahead_length: int = LOOKAHEAD_LENGTH, buffer_size: int = BUFFER_SIZE, episode_limit: int = 150,
-                 test_seed: int = 42, *args, **kwargs):
+                 num_layers: int = NUM_LAYERS, lookahead_length: int = LOOKAHEAD_LENGTH, buffer_size: int = BUFFER_SIZE, episode_limit: int = 150, c_constant: float = 2,
+                 lr: float = LEARNING_RATE, lr_decay: float = LR_DECAY, lr_decay_step: int = LR_DECAY_STEP, weight_decay: float = WEIGHT_DECAY,
+                 test_seed: int = 42, log_path: Path | None = LOG_DIR, wandb_run = None, snapshots: bool = True, *args, **kwargs):
         """
         :param env: Particular routing environment we want to apply the agent to
         :param device: Device to run the agent on (cuda for Nvidia graphics card, cpu for a standard cpu)
@@ -151,6 +153,7 @@ class AlphaRouterAgent(nn.Module):
         :param lookahead_length: The maximal number of the gates ahead that we will analyze
         :param buffer_size: Size of the replay buffer (its capacity)
         """
+        self.dir_path = None
         print('Init')
         super().__init__(*args, **kwargs)
         self.device = device
@@ -173,16 +176,25 @@ class AlphaRouterAgent(nn.Module):
         self.qubit_embedding.weight.share_memory_()
         print(self.qubit_embedding.weight)
         self.action_space_size = len(connection_graph.edges)
+        self.c_constant = c_constant
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.log_dir = log_path
+        self.wandb_run = wandb_run
+        self.snapshots = snapshots
 
         embedding_dim = embedding_dim + 1  # Embedding dim + 1 for depth
 
-        if (embedding_dim) % num_heads != 0:
-            # Increase the dimension so that it is a multiple of the number of heads
-            padded_embedding_dim = (embedding_dim // num_heads + 1) * num_heads
-            self.padding_dim = padded_embedding_dim - embedding_dim
-            embedding_dim = padded_embedding_dim
-        else:
-            self.padding_dim = 0
+        # if (embedding_dim) % num_heads != 0:
+        #     # Increase the dimension so that it is a multiple of the number of heads
+        #     padded_embedding_dim = (embedding_dim // num_heads + 1) * num_heads
+        #     self.padding_dim = padded_embedding_dim - embedding_dim
+        #     embedding_dim = padded_embedding_dim
+        # else:
+        #     self.padding_dim = 0
+        self.padding_dim = 0
+
+        assert d_model % num_heads == 0
 
         self.transformer = Transformer(embedding_dim, num_heads, d_model, ffn_dim, num_layers, lookahead_length,
                                        swap_options=self.action_space_size, device=self.device).to(self.device)
@@ -195,9 +207,10 @@ class AlphaRouterAgent(nn.Module):
 
         # self.scaler = GradScaler(device=self.device.type)
         self.optimizer = torch.optim.Adam(list(self.transformer.parameters()) + list(self.qubit_embedding.parameters()),
-                                          lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-        # self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=LR_DECAY_STEP,
-        #                                                  gamma=LR_DECAY)
+                                          lr=self.lr, weight_decay=self.weight_decay)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=lr_decay_step,
+                                                         gamma=lr_decay)
+        # self.scheduler = get_linear_schedule_with_warmup(optimizer=self.optimizer, num_warmup_steps=500,num_training_steps=0)
 
         env_fns = [make_env(connection_graph, interaction_generator) for _ in range(N_ENVS)]
         self.vec_env = SyncVectorEnv(env_fns)
@@ -341,8 +354,8 @@ class AlphaRouterAgent(nn.Module):
 
         if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
             mcts_input = self.replay_buffer.sample(batch_size)
-            torch.save(self.qubit_embedding.state_dict(), TEMP_EMBEDDING_DIR)
             if MCTS_PROCESSES > 1:
+                torch.save(self.qubit_embedding.state_dict(), TEMP_EMBEDDING_DIR)
                 self.transformer.cpu()
             mcts_actions, mcts_state_evals = self.mcts.run(mcts_input)
 
@@ -504,7 +517,8 @@ class AlphaRouterAgent(nn.Module):
     # def _has_passed_recurring_threshold(total_iterations, iteration, number_of_thresholds):
     #     return (iteration * number_of_thresholds / total_iterations)
 
-    def learn(self, total_timesteps: int, ma_window: int = 10, batch: bool = True, batch_size: int = BATCH_SIZE) -> None:
+    def learn(self, total_timesteps: int, ma_window: int = 10, batch: bool = True, batch_size: int = BATCH_SIZE,
+              plot: bool = True) -> None:
         """
         Conduct the learning process of the agent
         :param total_timesteps: Number of episodes during the learning process
@@ -524,18 +538,18 @@ class AlphaRouterAgent(nn.Module):
 
         if MCTS_PROCESSES > 1:
             print("Parallel MCTS Init")
-            print(self.qubit_embedding.weight)
+            # print(self.qubit_embedding.weight)
             self.qubit_embedding.cpu()
-            self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device, c=2,
+            self.mcts = ParallelMCTS(self.transformer, self.qubit_embedding, self.device, c=self.c_constant,
                                      swap_options=self.action_space_size, lookahead_length=self.lookahead_length,
                                      embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200,
                                      processes=MCTS_PROCESSES, merge_worker_trees=False)
             print("Parallel MCTS Init successful")
             self.qubit_embedding.to(self.device)
-            print(self.qubit_embedding.weight)
+            # print(self.qubit_embedding.weight)
         else:
             print("MCTS Init")
-            self.mcts = MCTS(self.transformer, self.qubit_embedding, self.device, c=2,
+            self.mcts = MCTS(self.transformer, self.qubit_embedding, self.device, c=self.c_constant,
                                      swap_options=self.action_space_size, lookahead_length=self.lookahead_length,
                                      embedding_dim=self.embedding_dim, padding_dim=self.padding_dim, rollouts=200)
             print("MCTS Init successful")
@@ -565,7 +579,7 @@ class AlphaRouterAgent(nn.Module):
                 swaps.append(swap)
                 returns.append(ep_return)
 
-                if i != 0 and i % 512 == 0:
+                if self.snapshots and i != 0 and i % 512 == 0:
                     self.save_snapshot(snapshot)
                     snapshot += 1
         else:
@@ -589,13 +603,22 @@ class AlphaRouterAgent(nn.Module):
                 if isinstance(l2, Tensor):
                     l2 = l2.item()
 
+                if self.wandb_run is not None:
+                    self.wandb_run.log({
+                        "loss": loss,
+                        "l1": l1,
+                        "l2": l2,
+                        "swaps": ep_swaps,
+                        "swap_list": ep_swap_list
+                    })
+
                 swaps.append(ep_swaps)
                 swap_lists.append(ep_swap_list)
                 losses.append(loss)
                 losses_l1.append(l1)
                 losses_l2.append(l2)
 
-                # self.scheduler.step()
+                self.scheduler.step()
 
                 if i != 0 and i % 8 == 0:
                     self.save_snapshot(snapshot)
@@ -621,19 +644,20 @@ class AlphaRouterAgent(nn.Module):
         self._reset_test_envs()
         test_circuits = [env._state.interaction_circuit for env in self.test_vec_env.envs]
 
-        path = Path(LOG_DIR.joinpath(get_timestamp() + '.txt'))
+        path = Path(self.log_dir.joinpath(get_timestamp() + '.txt'))
+        self.dir_path = path
         with path.open('w', encoding='utf-8') as f:
             f.write(f'episodes: {total_timesteps}\n')
-            f.write(f'Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}\n')
+            f.write(f'Number of parameters: {sum(p.numel() for p in self.parameters() if p.requires_grad)}\n')
             f.write(f'Number of qubits: {self.n_qubits}\n')
             f.write(f'Number of edges: {self.n_edges}\n')
-            f.write(f'learning rate: {LEARNING_RATE}\n')
-            f.write(f'weight decay: {WEIGHT_DECAY}\n')
+            f.write(f'learning rate: {self.lr}\n')
+            f.write(f'weight decay: {self.weight_decay}\n')
             f.write(f'lr_decay: {LR_DECAY}\n')
             f.write(f'lr_decay_step: {LR_DECAY_STEP}\n')
             f.write(f'max_grad_norm: {MAX_GRAD_NORM}\n')
             f.write(f'N_ENVS: {N_ENVS}\n')
-            f.write(f'batch_size: {BATCH_SIZE}\n')
+            f.write(f'batch_size: {batch_size}\n')
             f.write(f'N_MCTS_WORKERS: {MCTS_PROCESSES}\n')
             f.write(f'swaps: {swaps}\n')
             f.write(f'ma_swaps: {ma_swaps}\n')
@@ -651,22 +675,24 @@ class AlphaRouterAgent(nn.Module):
             f.write(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}\n")
             f.write(f'The training took: {end - start} seconds\n')
 
-        episodes = range(1, total_timesteps + 1)
+        if plot:
 
-        plot(episodes, swaps, label='Swaps per Episode', xlabel='Episode', ylabel='Swaps', title='Swaps per Episode')
-        plot(episodes, losses, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss per Episode')
-        plot(episodes, losses_l1, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss L1 per Episode')
-        plot(episodes, losses_l2, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss L2 per Episode')
-        # plot(episodes, returns, label=f'Returns per episode', xlabel='Episode', ylabel='Return', title='Returns per episode')
-        plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title=f'Swaps per episode {ma_window}-Episode MA')
-        plot(episodes, ma_loss, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Loss', title=f'Loss per Episode {ma_window}-Episode MA')
+            episodes = range(1, total_timesteps + 1)
 
-        circuits = range(N_ENVS)
+            plot(episodes, swaps, label='Swaps per Episode', xlabel='Episode', ylabel='Swaps', title='Swaps per Episode')
+            plot(episodes, losses, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss per Episode')
+            plot(episodes, losses_l1, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss L1 per Episode')
+            plot(episodes, losses_l2, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss L2 per Episode')
+            # plot(episodes, returns, label=f'Returns per episode', xlabel='Episode', ylabel='Return', title='Returns per episode')
+            plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title=f'Swaps per episode {ma_window}-Episode MA')
+            plot(episodes, ma_loss, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Loss', title=f'Loss per Episode {ma_window}-Episode MA')
 
-        plot_subplots(circuits, [swap_lists[-1], benchmark_swap_list], labels=['AlphaRouter (final agent)', 'SABRE'], xlabel='Circuit', ylabel='Swaps', title='Swaps per Circuit')
+            circuits = range(N_ENVS)
 
-        for i, env in enumerate(self.test_vec_env.envs):
-            render_rgb(env, title=f'Test circuit #{i}')
+            plot_subplots(circuits, [swap_lists[-1], benchmark_swap_list], labels=['AlphaRouter (final agent)', 'SABRE'], xlabel='Circuit idx', ylabel='Swaps', title='Swaps per Circuit')
+
+            for i, env in enumerate(self.test_vec_env.envs):
+                render_rgb(env, title=f'Test circuit #{i}')
         # plot(episodes, ma_loss_l1, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L1 per Episode {ma_window}-Episode MA')
         # plot(episodes, ma_loss_l2, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L2 per Episode {ma_window}-Episode MA')
         # plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
@@ -726,8 +752,8 @@ if __name__ == '__main__':
     boost_process_priority()
 
     connection_graph = nx.Graph()
-    connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
-    # connection_graph.add_edges_from([(0,1), (1,2), (2,3), (3,4)])
+    # connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
+    connection_graph.add_edges_from([(0,1), (1,2), (2,3), (3,4)])
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
 
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
@@ -747,11 +773,11 @@ if __name__ == '__main__':
     print(f"device: {device}")
     path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
 
-    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=BasicInteractionGenerator(max_length=30),
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=BasicInteractionGenerator(max_length=10),
                              device=device, episode_limit=100).to(device)
 
     ### LOAD AND RESUME TRAINING OF A SPECIFIC MODEL INSTEAD OF STARTING FROM SCRATCH???
-    # path = MODEL_DIR.joinpath(f"model_2026-01-21T00-10-47-347506.pt")
+    # path = MODEL_DIR.joinpath(f"model_2026-02-04T13-22-11-738563.pt")
     # path = TEMP_MODEL_DIR.joinpath(f"model_temp_18.pt")
     # model.load_state_dict(torch.load(path, weights_only=True, map_location=device))
     print(path)
@@ -759,7 +785,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(5, batch=True, batch_size=BATCH_SIZE)
+    model.learn(25, batch=True, batch_size=BATCH_SIZE)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
