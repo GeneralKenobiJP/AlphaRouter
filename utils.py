@@ -2,6 +2,7 @@ import bz2
 import datetime
 import gzip
 import lzma
+import os
 from collections import deque
 from pathlib import Path
 from sys import platform
@@ -137,6 +138,10 @@ def boost_process_priority():
         h = win32api.GetCurrentProcess()
         win32process.SetPriorityClass(h, win32process.REALTIME_PRIORITY_CLASS)
         win32process.SetThreadPriority(h, win32process.THREAD_PRIORITY_TIME_CRITICAL)
+
+def clear_terminal():
+    if platform == 'Windows':
+        os.system('cls')
 
 def compare_routing_states(state1: RoutingState, state2: RoutingState) -> bool:
     if not (isinstance(state1, RoutingState) and isinstance(state2, RoutingState)):

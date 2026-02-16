@@ -140,7 +140,7 @@ class AlphaRouterAgent(nn.Module):
     """The AlphaRouter routing agent"""
     def __init__(self, connection_graph: nx.Graph, interaction_generator: InteractionGenerator | None = None,
                  device: Device = torch.device("cpu"), embedding_dim: int = EMBEDDING_DIM, num_heads: int = NUM_HEADS, d_model: int = D_MODEL, ffn_dim: int = FFN_DIM,
-                 num_layers: int = NUM_LAYERS, lookahead_length: int = LOOKAHEAD_LENGTH, buffer_size: int = BUFFER_SIZE, episode_limit: int = 150, c_constant: float = 2,
+                 num_layers: int = NUM_LAYERS, lookahead_length: int = LOOKAHEAD_LENGTH, buffer_size: int = BUFFER_SIZE, episode_limit: int = 100, c_constant: float = 2,
                  lr: float = LEARNING_RATE, lr_decay: float = LR_DECAY, lr_decay_step: int = LR_DECAY_STEP, weight_decay: float = WEIGHT_DECAY,
                  test_seed: int = 42, log_path: Path | None = LOG_DIR, wandb_run = None, snapshots: bool = True, *args, **kwargs):
         """
@@ -178,6 +178,7 @@ class AlphaRouterAgent(nn.Module):
         self.action_space_size = len(connection_graph.edges)
         self.c_constant = c_constant
         self.lr = lr
+        self.lr_decay = lr_decay
         self.weight_decay = weight_decay
         self.log_dir = log_path
         self.wandb_run = wandb_run
@@ -518,7 +519,7 @@ class AlphaRouterAgent(nn.Module):
     #     return (iteration * number_of_thresholds / total_iterations)
 
     def learn(self, total_timesteps: int, ma_window: int = 10, batch: bool = True, batch_size: int = BATCH_SIZE,
-              plot: bool = True) -> None:
+              plot: bool = True, save_model: bool = False) -> None:
         """
         Conduct the learning process of the agent
         :param total_timesteps: Number of episodes during the learning process
@@ -618,7 +619,8 @@ class AlphaRouterAgent(nn.Module):
                 losses_l1.append(l1)
                 losses_l2.append(l2)
 
-                self.scheduler.step()
+                if self.lr_decay < 1:
+                    self.scheduler.step()
 
                 if i != 0 and i % 8 == 0:
                     self.save_snapshot(snapshot)
@@ -696,6 +698,11 @@ class AlphaRouterAgent(nn.Module):
         # plot(episodes, ma_loss_l1, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L1 per Episode {ma_window}-Episode MA')
         # plot(episodes, ma_loss_l2, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L2 per Episode {ma_window}-Episode MA')
         # plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
+
+        if save_model:
+            path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
+            torch.save(model.state_dict(), path)
+            print('Model saved successfully')
 
     def forward(self, env: Routing, plot: bool = False):
         state: RoutingState = env._state

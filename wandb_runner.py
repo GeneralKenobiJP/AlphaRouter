@@ -9,9 +9,10 @@ from custom_interaction_generator import CustomInteractionGenerator
 
 from main import AlphaRouterAgent
 
-import os
 import gc
 import multiprocessing as mp
+
+from utils import clear_terminal
 
 sweep_config = {
     "method": "bayes",
@@ -27,16 +28,16 @@ sweep_config = {
             "min": 2e-4,
             "max": 5e-3,
         },
-        "lr_decay": {
-            "distribution": "uniform",
-            "min": 0.9,
-            "max": 1.0,
-        },
-        "weight_decay": {
-            "distribution": "log_uniform_values",
-            "min": 1e-8,
-            "max": 1e-2,
-        },
+        # "lr_decay": {
+        #     "distribution": "uniform",
+        #     "min": 0.9,
+        #     "max": 1.0,
+        # },
+        # "weight_decay": {
+        #     "distribution": "log_uniform_values",
+        #     "min": 1e-8,
+        #     "max": 1e-2,
+        # },
         "embedding_dim": {
             "distribution": "int_uniform",
             "min": 16,
@@ -59,7 +60,7 @@ sweep_config = {
         "episodes": {
             "distribution": "log_uniform_values",
             "min": 200,
-            "max": 2500,
+            "max": 1500,
         },
         "seed": {"values": [0, 1, 2, 42, 69, 2137]},
     },
@@ -93,7 +94,7 @@ def train(connection_graph, interaction_generator=None, device="cpu"):
         agent = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=interaction_generator, device=device,
                                  embedding_dim=cfg.embedding_dim, num_heads=cfg.num_heads, d_model=d_model,
                                  ffn_dim=4*d_model, num_layers=cfg.num_layers, lookahead_length=cfg.lookahead_length, c_constant=cfg.c_constant,
-                                 lr=cfg.lr, lr_decay=cfg.lr_decay, weight_decay=cfg.weight_decay, log_path=run_dir,
+                                 lr=cfg.lr, log_path=run_dir, episode_limit=100,
                                  wandb_run=run, snapshots=False)
 
         agent.learn(int(cfg.episodes), batch_size=cfg.batch_size, plot=False)
@@ -106,7 +107,7 @@ def train(connection_graph, interaction_generator=None, device="cpu"):
         if run is not None:
             wandb.finish()
 
-    os.system('cls')
+    clear_terminal()
     del agent
     gc.collect()
 
@@ -124,17 +125,30 @@ def train_subprocess(connection_graph, interaction_generator=None, device="cpu")
     if training_process.exitcode != 0:
         raise RuntimeError(f"train() subprocess failed with exit code {training_process.exitcode}")
 
-def run_sweep(connection_graph, interaction_generator=None, runs=25, device="cpu"):
-    sweep_id = wandb.sweep(sweep=sweep_config, project="alpharouter")
+def _run_agent(sweep_id, connection_graph, interaction_generator, device, runs):
     wandb.agent(
         sweep_id,
         function=lambda: train(connection_graph, interaction_generator, device),
         count=runs,
     )
 
+def run_sweep(connection_graph, interaction_generator=None, runs=25, processes=1, device="cpu"):
+    sweep_id = wandb.sweep(sweep=sweep_config, project="alpharouter")
+
+    runs_per_agent = runs // processes
+
+    agent_processes = [mp.Process(target=_run_agent,
+                                  args=(sweep_id, connection_graph, interaction_generator, device, runs_per_agent))
+             for _ in range(processes)]
+    for agent in agent_processes: agent.start()
+    for agent in agent_processes: agent.join()
+
+
 if __name__ == "__main__":
     connection_graph = nx.Graph()
     connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
     interaction_generator = CustomInteractionGenerator()
 
-    run_sweep(connection_graph, interaction_generator=interaction_generator)
+    run_sweep(connection_graph, interaction_generator=interaction_generator, runs=30, processes=5)
+
+#todo: make episode limit depend on qubit count
