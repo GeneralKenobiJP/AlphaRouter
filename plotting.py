@@ -19,11 +19,11 @@ def plot(x_axis, values, label, xlabel, ylabel, title):
     plt.tight_layout()
     plt.show()
 
-def plot_subplots(x_axis, values_lists, labels, xlabel, ylabel, title):
+def plot_subplots(x_axis, values_lists, labels, linestyle, xlabel, ylabel, title):
     fig, ax = plt.subplots(figsize=(12, 6))
 
     for values, label in zip(values_lists, labels):
-        ax.plot(x_axis, values, label=label, linewidth=2)
+        ax.plot(x_axis, values, label=label, linewidth=2, linestyle=linestyle)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -31,6 +31,32 @@ def plot_subplots(x_axis, values_lists, labels, xlabel, ylabel, title):
     ax.grid(True)
     plt.tight_layout()
     plt.show()
+
+    return fig, ax
+
+
+def plot_subplots_2scales(x_axis, values_lists1, values_lists2, labels1, labels2, xlabel, ylabel1, ylabel2, title):
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    for values, label in zip(values_lists1, labels1):
+        ax.plot(x_axis, values, label=label, linewidth=2)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel1)
+    ax.set_title(title)
+
+    ax2 = ax.twinx()
+    for values, label in zip(values_lists2, labels2):
+        ax2.plot(x_axis, values, label=label, linewidth=2, linestyle='--', color='red')
+
+    ax2.set_ylabel(ylabel2)
+    ax2.legend()
+    ax.legend()
+    ax.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    return fig, ax
 
 def moving_average(values, window):
     ma_values = []

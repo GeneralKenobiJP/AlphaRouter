@@ -27,7 +27,7 @@ from transformers import get_linear_schedule_with_warmup
 from benchmark import benchmark
 from custom_interaction_generator import CustomInteractionGenerator
 from mcts import ParallelMCTS, MCTS
-from plotting import moving_average, plot, plot_mapping_and_circuit, plot_subplots, render_rgb
+from plotting import moving_average, plot, plot_mapping_and_circuit, plot_subplots, render_rgb, plot_subplots_2scales
 
 from gymnasium.vector import SyncVectorEnv
 
@@ -383,7 +383,7 @@ class AlphaRouterAgent(nn.Module):
             l2 = (state_values - mcts_state_evals).pow(2)
             print(f'### l2: {l2}')
 
-            self.loss_coefficient = np.sqrt((l1.detach() ** 2).sum() / (l2.detach() ** 2).sum())
+            self.loss_coefficient = np.sqrt((l1.cpu().detach() ** 2).sum() / (l2.cpu().detach() ** 2).sum())
             print(f'### loss_coefficient: {self.loss_coefficient}')
             # assert l1.requires_grad
             # assert l2.requires_grad
@@ -519,7 +519,7 @@ class AlphaRouterAgent(nn.Module):
     #     return (iteration * number_of_thresholds / total_iterations)
 
     def learn(self, total_timesteps: int, ma_window: int = 10, batch: bool = True, batch_size: int = BATCH_SIZE,
-              plot: bool = True, save_model: bool = False) -> None:
+              plot_graphs: bool = True, save_model: bool = False) -> None:
         """
         Conduct the learning process of the agent
         :param total_timesteps: Number of episodes during the learning process
@@ -645,6 +645,7 @@ class AlphaRouterAgent(nn.Module):
 
         self._reset_test_envs()
         test_circuits = [env._state.interaction_circuit for env in self.test_vec_env.envs]
+        circuit_lengths = [len(test_circuit) for test_circuit in test_circuits]
 
         path = Path(self.log_dir.joinpath(get_timestamp() + '.txt'))
         self.dir_path = path
@@ -677,7 +678,7 @@ class AlphaRouterAgent(nn.Module):
             f.write(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}\n")
             f.write(f'The training took: {end - start} seconds\n')
 
-        if plot:
+        if plot_graphs:
 
             episodes = range(1, total_timesteps + 1)
 
@@ -691,7 +692,9 @@ class AlphaRouterAgent(nn.Module):
 
             circuits = range(N_ENVS)
 
-            plot_subplots(circuits, [swap_lists[-1], benchmark_swap_list], labels=['AlphaRouter (final agent)', 'SABRE'], xlabel='Circuit idx', ylabel='Swaps', title='Swaps per Circuit')
+            plot_subplots_2scales(circuits, [swap_lists[-1], benchmark_swap_list], [circuit_lengths],
+                          labels1=['AlphaRouter (final agent)', 'SABRE'], labels2=['Circuit length'],
+                          xlabel='Circuit idx', ylabel1='Swaps', ylabel2='Gates', title='Swaps per Circuit')
 
             for i, env in enumerate(self.test_vec_env.envs):
                 render_rgb(env, title=f'Test circuit #{i}')
@@ -760,11 +763,11 @@ if __name__ == '__main__':
 
     connection_graph = nx.Graph()
     # connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
-    connection_graph.add_edges_from([(0,1), (1,2), (2,3), (3,4)])
+    # connection_graph.add_edges_from([(0,1), (1,2), (2,3), (3,4)])
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
 
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
-    # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7), (7,8), (8,9)])
+    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7), (7,8), (8,9)])
 
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (5,6), (6,7), (7,8), (8,9), (10,11),(11,12),(12,13), (13,14), (0,5), (5, 10), (1, 6), (6,11), (2,7), (7,12), (3,8), (8,13), (4,9), (9,14)])
     # width = 5
@@ -780,8 +783,15 @@ if __name__ == '__main__':
     print(f"device: {device}")
     path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
 
-    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=BasicInteractionGenerator(max_length=10),
-                             device=device, episode_limit=100).to(device)
+    # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=BasicInteractionGenerator(max_length=30),
+    #                          device=device, episode_limit=100).to(device)
+    # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=BasicInteractionGenerator(max_length=30),
+    #                          c_constant=2.4, d_model=40, num_layers=2, num_heads=4, embedding_dim=20, lr=0.0025,
+    #                          device=device, episode_limit=100).to(device)
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
+                            c_constant=1.6254088840047858, d_model=29*5, num_layers=2, num_heads=5, embedding_dim=20,
+                            lookahead_length=32, lr=0.0004865268914714449,
+                              device=device, episode_limit=100).to(device)
 
     ### LOAD AND RESUME TRAINING OF A SPECIFIC MODEL INSTEAD OF STARTING FROM SCRATCH???
     # path = MODEL_DIR.joinpath(f"model_2026-02-04T13-22-11-738563.pt")
@@ -792,7 +802,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(25, batch=True, batch_size=BATCH_SIZE)
+    model.learn(1300, batch=True, batch_size=64)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
@@ -829,7 +839,7 @@ if __name__ == '__main__':
     ### LOAD A SPECIFIC MODEL INSTEAD OF THE LAST ONE???
     # path = MODEL_DIR.joinpath(f"model_1028_far_gate_patched_qgym_paper_hyper_2-2025-12-04T11-27-24-601885.pt")
 
-    inference_model = AlphaRouterAgent(connection_graph=connection_graph, device=device, episode_limit=90).to(device)
+    inference_model = AlphaRouterAgent(connection_graph=connection_graph, device=device, episode_limit=100).to(device)
     inference_model.load_state_dict(torch.load(path, weights_only=True))
     inference_model.eval()
     print('Model loaded successfully')
