@@ -57,11 +57,11 @@ sweep_config = {
         "batch_size": {"values": [32, 64]},
 
         # Run-control
-        "episodes": {
-            "distribution": "log_uniform_values",
-            "min": 200,
-            "max": 1500,
-        },
+        # "episodes": {
+        #     "distribution": "log_uniform_values",
+        #     "min": 200,
+        #     "max": 1500,
+        # },
         "seed": {"values": [0, 1, 2, 42, 69, 2137]},
     },
 
@@ -94,10 +94,10 @@ def train(connection_graph, interaction_generator=None, device="cpu"):
         agent = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=interaction_generator, device=device,
                                  embedding_dim=cfg.embedding_dim, num_heads=cfg.num_heads, d_model=d_model,
                                  ffn_dim=4*d_model, num_layers=cfg.num_layers, lookahead_length=cfg.lookahead_length, c_constant=cfg.c_constant,
-                                 lr=cfg.lr, log_path=run_dir, episode_limit=100,
+                                     lr=cfg.lr, log_path=run_dir, episode_limit=120,
                                  wandb_run=run, snapshots=False)
 
-        agent.learn(int(cfg.episodes), batch_size=cfg.batch_size, plot=False)
+        agent.learn(800, batch_size=cfg.batch_size, plot_graphs=False, save_model=True) #todo: save_model = True
 
         artifact = wandb.Artifact(name="run_logs", type="logs")
         if agent.dir_path is not None:
@@ -146,9 +146,9 @@ def run_sweep(connection_graph, interaction_generator=None, runs=25, processes=1
 
 if __name__ == "__main__":
     connection_graph = nx.Graph()
-    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
+    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7), (7,8), (8,9)])
     interaction_generator = CustomInteractionGenerator()
 
-    run_sweep(connection_graph, interaction_generator=interaction_generator, runs=30, processes=5)
+    run_sweep(connection_graph, interaction_generator=interaction_generator, runs=16, processes=4)
 
 #todo: make episode limit depend on qubit count
