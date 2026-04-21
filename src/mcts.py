@@ -28,7 +28,7 @@ from utils import embed_nodes, boost_process_priority, compare_routing_states, \
 
 mp.set_start_method("spawn", force=True)
 
-MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
+MODEL_DIR = Path(__file__).resolve().parent.joinpath('../models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
 TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
 TEMP_EMBEDDING_DIR = TEMP_MODEL_DIR.joinpath('temp_embedding.pt')
@@ -278,8 +278,15 @@ class MCTS:
         if len(self.root.children) == 0:
             return 0, 1, self.transposition_table
 
+        # Maximize state value
         best_action = self.root.children[
             max(self.root.children.keys(), key=lambda child: child.value / (child.visits + 1e-6))]
+
+        # Maximize visit count
+        # best_action = self.root.children[
+        #     max(self.root.children.keys(), key=lambda child: child.visits)
+        # ]
+
         if isinstance(best_action, Tensor):
             best_action = best_action.item()
 

@@ -97,7 +97,7 @@ def train(connection_graph, interaction_generator=None, device="cpu"):
                                      lr=cfg.lr, log_path=run_dir, episode_limit=120,
                                  wandb_run=run, snapshots=False)
 
-        agent.learn(800, batch_size=cfg.batch_size, plot_graphs=False, save_model=True) #todo: save_model = True
+        agent.learn(400, batch_size=cfg.batch_size, plot_graphs=False, save_model=True)
 
         artifact = wandb.Artifact(name="run_logs", type="logs")
         if agent.dir_path is not None:
@@ -146,9 +146,11 @@ def run_sweep(connection_graph, interaction_generator=None, runs=25, processes=1
 
 if __name__ == "__main__":
     connection_graph = nx.Graph()
-    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7), (7,8), (8,9)])
-    interaction_generator = CustomInteractionGenerator()
+    # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7), (7,8), (8,9)])
+    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3)])
+    # interaction_generator = CustomInteractionGenerator()
+    interaction_generator = None
 
-    run_sweep(connection_graph, interaction_generator=interaction_generator, runs=16, processes=4)
+    run_sweep(connection_graph, interaction_generator=interaction_generator, runs=36, processes=12)
 
 #todo: make episode limit depend on qubit count

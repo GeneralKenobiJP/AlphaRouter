@@ -56,12 +56,12 @@ LR_DECAY = 1
 MAX_GRAD_NORM = 1
 BUFFER_SIZE = int(1e5)
 
-MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
+MODEL_DIR = Path(__file__).resolve().parent.joinpath('../models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
 TEMP_BUFFER_DIR = TEMP_MODEL_DIR.joinpath('buffers/')
 TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
 TEMP_EMBEDDING_DIR = TEMP_MODEL_DIR.joinpath('temp_embedding.pt')
-LOG_DIR = Path(__file__).resolve().parent.joinpath('logs/')
+LOG_DIR = Path(__file__).resolve().parent.joinpath('../logs/')
 
 
 def make_env(connection_graph, interaction_generator: InteractionGenerator = None, rewarder=None):
@@ -762,12 +762,12 @@ if __name__ == '__main__':
     boost_process_priority()
 
     connection_graph = nx.Graph()
-    # connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
+    connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
     # connection_graph.add_edges_from([(0,1), (1,2), (2,3), (3,4)])
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,0)])
 
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7)])
-    connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7), (7,8), (8,9)])
+    # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (4,5), (5,6), (6,7), (7,8), (8,9)])
 
     # connection_graph.add_edges_from([(0, 1), (1, 2), (2, 3), (3,4), (5,6), (6,7), (7,8), (8,9), (10,11),(11,12),(12,13), (13,14), (0,5), (5, 10), (1, 6), (6,11), (2,7), (7,12), (3,8), (8,13), (4,9), (9,14)])
     # width = 5
@@ -788,7 +788,7 @@ if __name__ == '__main__':
     # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=BasicInteractionGenerator(max_length=30),
     #                          c_constant=2.4, d_model=40, num_layers=2, num_heads=4, embedding_dim=20, lr=0.0025,
     #                          device=device, episode_limit=100).to(device)
-    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=CustomInteractionGenerator(),
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=BasicInteractionGenerator(),
                             c_constant=1.6254088840047858, d_model=29*5, num_layers=2, num_heads=5, embedding_dim=20,
                             lookahead_length=32, lr=0.0004865268914714449,
                               device=device, episode_limit=100).to(device)
@@ -802,7 +802,7 @@ if __name__ == '__main__':
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
     start = time.time()
-    model.learn(1300, batch=True, batch_size=64)
+    model.learn(12, batch=True, batch_size=64)
     end = time.time()
     print(f'It took: {end - start} seconds')
 
