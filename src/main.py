@@ -64,10 +64,11 @@ TEMP_EMBEDDING_DIR = TEMP_MODEL_DIR.joinpath('temp_embedding.pt')
 LOG_DIR = Path(__file__).resolve().parent.joinpath('../logs/')
 
 
-def make_env(connection_graph, interaction_generator: InteractionGenerator = None, rewarder=None):
+def make_env(connection_graph, interaction_generator: InteractionGenerator = None, lookahead_length: int = LOOKAHEAD_LENGTH
+             , rewarder=None):
     def _thunk():
         env = Routing(
-            max_observation_reach=LOOKAHEAD_LENGTH,
+            max_observation_reach=lookahead_length,
             observe_legal_surpasses=True,
             observe_connection_graph=True,
             connection_graph=connection_graph,
@@ -157,7 +158,7 @@ class AlphaRouterAgent(nn.Module):
         print('Init')
         super().__init__(*args, **kwargs)
         self.device = device
-        self.env = make_env(connection_graph, interaction_generator)
+        self.env = make_env(connection_graph, interaction_generator, lookahead_length)
         self.n_qubits = connection_graph.number_of_nodes()
         self.n_edges = connection_graph.number_of_edges()
         # self.env.rewarder = ManhattanRewarder()
@@ -213,7 +214,7 @@ class AlphaRouterAgent(nn.Module):
                                                          gamma=lr_decay)
         # self.scheduler = get_linear_schedule_with_warmup(optimizer=self.optimizer, num_warmup_steps=500,num_training_steps=0)
 
-        env_fns = [make_env(connection_graph, interaction_generator) for _ in range(N_ENVS)]
+        env_fns = [make_env(connection_graph, interaction_generator, lookahead_length) for _ in range(N_ENVS)]
         self.vec_env = SyncVectorEnv(env_fns)
         self.test_vec_env = SyncVectorEnv(env_fns)
 
@@ -221,6 +222,11 @@ class AlphaRouterAgent(nn.Module):
         self.test_seed = test_seed
         self.test_vec_env.reset(seed=self.test_seed)
         self.test_states_backup = [deepcopy(env._state) for env in self.test_vec_env.envs]
+
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        TEMP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        TEMP_BUFFER_DIR.mkdir(parents=True, exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
 
         print('Init successful')
 
@@ -490,14 +496,14 @@ class AlphaRouterAgent(nn.Module):
 
         return mean_swaps, swaps
 
-    def benchmark(self, backend: str = 'SABRE') -> tuple[float, list[int]]:
+    def benchmark(self, backend: str = 'SABRE', show_circuits: bool = True) -> tuple[float, list[int]]:
         # self.test_vec_env.reset(seed=self.test_seed)
         self._reset_test_envs()
 
         swaps = []
 
         for env in self.test_vec_env.envs:
-            swaps.append(benchmark(env, seed=None, backend=backend, show_circuits=True))
+            swaps.append(benchmark(env, seed=None, backend=backend, show_circuits=show_circuits))
 
         mean_swaps = mean(swaps)
         print(f'### BENCHMARK mean_swaps: {mean_swaps}')
@@ -519,7 +525,7 @@ class AlphaRouterAgent(nn.Module):
     #     return (iteration * number_of_thresholds / total_iterations)
 
     def learn(self, total_timesteps: int, ma_window: int = 10, batch: bool = True, batch_size: int = BATCH_SIZE,
-              plot_graphs: bool = True, save_model: bool = False) -> None:
+              plot_graphs: bool = True, show_circuits: bool = True, save_model: bool = False) -> None:
         """
         Conduct the learning process of the agent
         :param total_timesteps: Number of episodes during the learning process
@@ -569,7 +575,7 @@ class AlphaRouterAgent(nn.Module):
 
         print(f'### BENCHMARKING THE TEST CIRCUITS')
 
-        benchmark_swaps, benchmark_swap_list = self.benchmark(backend='SABRE')
+        benchmark_swaps, benchmark_swap_list = self.benchmark(backend='SABRE', show_circuits=show_circuits)
 
         start = time.time()
 
@@ -704,7 +710,7 @@ class AlphaRouterAgent(nn.Module):
 
         if save_model:
             path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
-            torch.save(model.state_dict(), path)
+            torch.save(self.state_dict(), path)
             print('Model saved successfully')
 
     def forward(self, env: Routing, plot: bool = False):

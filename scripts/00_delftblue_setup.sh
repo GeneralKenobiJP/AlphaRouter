@@ -17,24 +17,19 @@ fi
 
 mkdir -p "$HOME/venvs" "$WHEELHOUSE"
 
-# Small bootstrap env used only to build wheels and run W&B CLI on login nodes
 if [ ! -d "$BOOTSTRAP_VENV" ]; then
     python -m venv "$BOOTSTRAP_VENV"
 fi
 source "$BOOTSTRAP_VENV/bin/activate"
 
 python -m pip install --upgrade pip wheel wandb
-
-# Build/download all requirement wheels while on a node with internet access
 python -m pip wheel -r "$REQ_FILE" -w "$WHEELHOUSE"
 
-# Create the runtime venv once; packages get installed into it by the job script if needed
 if [ ! -d "$RUN_VENV" ]; then
     python -m venv "$RUN_VENV"
 fi
 
-# Authenticate W&B once and store credentials locally
-wandb login --verify=True
+wandb login --verify
 
 echo
 echo "Setup complete."
