@@ -12,6 +12,7 @@ from main import AlphaRouterAgent
 import gc
 import multiprocessing as mp
 
+from src.curriculum_scheduler import CurriculumScheduler
 from utils import clear_terminal
 
 sweep_config = {
@@ -55,6 +56,8 @@ sweep_config = {
 
         "lookahead_length": {"values": [32, 36, 40, 44, 48]},
         "batch_size": {"values": [32, 64]},
+        "curriculum_proceed_threshold": {"distribution": "uniform", "min": 1.25, "max": 2.0},
+        "curriculum_retreat_threshold": {"distribution": "uniform", "min": 2.5, "max": 5.0},
 
         # Run-control
         # "episodes": {
@@ -91,13 +94,16 @@ def train(connection_graph, interaction_generator=None, device="cpu"):
 
         d_model = cfg.d_model_const * cfg.num_heads
 
+        curriculum = CurriculumScheduler(proceed_threshold=cfg.curriculum_proceed_threshold,
+                                         retreat_threshold=cfg.curriculum_retreat_threshold)
+
         agent = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=interaction_generator, device=device,
                                  embedding_dim=cfg.embedding_dim, num_heads=cfg.num_heads, d_model=d_model,
                                  ffn_dim=4*d_model, num_layers=cfg.num_layers, lookahead_length=cfg.lookahead_length, c_constant=cfg.c_constant,
                                      lr=cfg.lr, log_path=run_dir, episode_limit=120,
                                  wandb_run=run, snapshots=False)
 
-        agent.learn(400, batch_size=cfg.batch_size, plot_graphs=False, save_model=True)
+        agent.learn(30, batch_size=cfg.batch_size, plot_graphs=False, save_model=True, curriculum_scheduler=curriculum)
 
         artifact = wandb.Artifact(name="run_logs", type="logs")
         if agent.dir_path is not None:
@@ -151,6 +157,6 @@ if __name__ == "__main__":
     # interaction_generator = CustomInteractionGenerator()
     interaction_generator = None
 
-    run_sweep(connection_graph, interaction_generator=interaction_generator, runs=36, processes=12)
+    run_sweep(connection_graph, interaction_generator=interaction_generator, runs=4, processes=4)
 
 #todo: make episode limit depend on qubit count

@@ -31,6 +31,7 @@ from plotting import moving_average, plot, plot_mapping_and_circuit, plot_subplo
 
 from gymnasium.vector import SyncVectorEnv
 
+from curriculum_scheduler import CurriculumScheduler, compute_performance, GateLengthCurriculumGenerator
 from transformer import Transformer, choose_actions
 from utils import NormalizeInfoWrapper, embed_nodes, boost_process_priority, \
     open_binary, get_timestamp, env_surpass_all_possible_gates, env_surpass_all_possible_gates_with_info
@@ -104,6 +105,9 @@ class ReplayBuffer:
         """
         self.buffer.append(deepcopy(state))
 
+    def clear(self):
+        self.buffer.clear()
+
     def sample(self, batch_size: int):
         """
         Samples a batch of transitions, returning:
@@ -137,6 +141,7 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+
 class AlphaRouterAgent(nn.Module):
     """The AlphaRouter routing agent"""
     def __init__(self, connection_graph: nx.Graph, interaction_generator: InteractionGenerator | None = None,
@@ -158,6 +163,7 @@ class AlphaRouterAgent(nn.Module):
         print('Init')
         super().__init__(*args, **kwargs)
         self.device = device
+        self.connection_graph = connection_graph
         self.env = make_env(connection_graph, interaction_generator, lookahead_length)
         self.n_qubits = connection_graph.number_of_nodes()
         self.n_edges = connection_graph.number_of_edges()
@@ -214,14 +220,12 @@ class AlphaRouterAgent(nn.Module):
                                                          gamma=lr_decay)
         # self.scheduler = get_linear_schedule_with_warmup(optimizer=self.optimizer, num_warmup_steps=500,num_training_steps=0)
 
-        env_fns = [make_env(connection_graph, interaction_generator, lookahead_length) for _ in range(N_ENVS)]
-        self.vec_env = SyncVectorEnv(env_fns)
-        self.test_vec_env = SyncVectorEnv(env_fns)
+        self.test_seed = test_seed
 
         self.unfinished_indices = set(range(N_ENVS))
-        self.test_seed = test_seed
-        self.test_vec_env.reset(seed=self.test_seed)
-        self.test_states_backup = [deepcopy(env._state) for env in self.test_vec_env.envs]
+
+        self._make_envs(connection_graph, interaction_generator, lookahead_length)
+        self.curriculum = None
 
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
         TEMP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -229,6 +233,18 @@ class AlphaRouterAgent(nn.Module):
         LOG_DIR.mkdir(parents=True, exist_ok=True)
 
         print('Init successful')
+
+    def _make_envs(self, connection_graph, interaction_generator: InteractionGenerator = None,
+                   lookahead_length: int = LOOKAHEAD_LENGTH):
+        env_fns = [make_env(connection_graph, interaction_generator, lookahead_length) for _ in range(N_ENVS)]
+        self.vec_env = SyncVectorEnv(env_fns)
+        self.vec_env.reset()
+        self.test_vec_env = SyncVectorEnv(env_fns)
+
+        self.unfinished_indices = set(range(N_ENVS))
+
+        self.test_vec_env.reset(seed=self.test_seed)
+        self.test_states_backup = [deepcopy(env._state) for env in self.test_vec_env.envs]
 
     def _reset_test_envs(self):
         for i in range(len(self.test_vec_env.envs)):
@@ -359,7 +375,8 @@ class AlphaRouterAgent(nn.Module):
 
         print(f'### Replay buffer size: {len(self.replay_buffer.buffer)}')
 
-        if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
+        if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS or (
+                len(self.unfinished_indices) == 0 and len(self.replay_buffer.buffer) > batch_size):
             mcts_input = self.replay_buffer.sample(batch_size)
             if MCTS_PROCESSES > 1:
                 torch.save(self.qubit_embedding.state_dict(), TEMP_EMBEDDING_DIR)
@@ -525,6 +542,7 @@ class AlphaRouterAgent(nn.Module):
     #     return (iteration * number_of_thresholds / total_iterations)
 
     def learn(self, total_timesteps: int, ma_window: int = 10, batch: bool = True, batch_size: int = BATCH_SIZE,
+              curriculum_scheduler: CurriculumScheduler | None = None,
               plot_graphs: bool = True, show_circuits: bool = True, save_model: bool = False) -> None:
         """
         Conduct the learning process of the agent
@@ -532,6 +550,10 @@ class AlphaRouterAgent(nn.Module):
         :param ma_window: The size of the moving average window used for filtering out noise in the graphs
         :batch: If true - computes in batches with B=N_ENV
         """
+        if curriculum_scheduler is not None:
+            current_generator = curriculum_scheduler.make_schedule()
+            self._make_envs(self.connection_graph, current_generator, self.lookahead_length)
+
         self.unfinished_indices = set(range(N_ENVS))
         self.vec_env.reset()
 
@@ -593,7 +615,9 @@ class AlphaRouterAgent(nn.Module):
             for i in tqdm(range(int(total_timesteps))):
                 print(f"\n\nEpisode: {i+1}...")
                 loss, l1, l2 = self.batch(batch_size=batch_size)
-                if len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS:
+                if ((len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS or (
+                        (len(self.unfinished_indices) == 0) and len(self.replay_buffer.buffer) > batch_size))
+                        and curriculum_scheduler is not None):
                     print(f'Running the test set (Episode: {i+1})...')
                     ep_swaps, ep_swap_list = self.test()
                 else:
@@ -611,13 +635,23 @@ class AlphaRouterAgent(nn.Module):
                     l2 = l2.item()
 
                 if self.wandb_run is not None:
-                    self.wandb_run.log({
-                        "loss": loss,
-                        "l1": l1,
-                        "l2": l2,
-                        "swaps": ep_swaps,
-                        "swap_list": ep_swap_list
-                    })
+                    if curriculum_scheduler is None:
+                        self.wandb_run.log({
+                            "loss": loss,
+                            "l1": l1,
+                            "l2": l2,
+                            "swaps": ep_swaps,
+                            "swap_list": ep_swap_list
+                        })
+                    else:
+                        self.wandb_run.log({
+                            "loss": loss,
+                            "l1": l1,
+                            "l2": l2,
+                            "swaps": ep_swaps,
+                            "swap_list": ep_swap_list,
+                            "curriculum_level": curriculum_scheduler.current_level
+                        })
 
                 swaps.append(ep_swaps)
                 swap_lists.append(ep_swap_list)
@@ -625,10 +659,27 @@ class AlphaRouterAgent(nn.Module):
                 losses_l1.append(l1)
                 losses_l2.append(l2)
 
+                if ((len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS or (len(self.unfinished_indices) == 0))
+                        and curriculum_scheduler is not None):
+                    performance = compute_performance(ep_swaps, benchmark_swaps)
+                    print(f"### PERFORMANCE: {performance}")
+                    force_update = len(self.unfinished_indices) == 0 and len(self.replay_buffer.buffer) < batch_size
+                    if curriculum_scheduler.update_schedule(performance, force_update):
+                        print(f"### CURRICULUM UPDATED")
+                        current_generator = curriculum_scheduler.make_schedule()
+                        self._make_envs(self.connection_graph, current_generator, self.lookahead_length)
+
+                        print(f'### BENCHMARKING THE TEST CIRCUITS UNDER A NEW CURRICULUM')
+                        benchmark_swaps, benchmark_swap_list = self.benchmark(backend='SABRE',
+                                                                              show_circuits=show_circuits)
+
+                        # self.replay_buffer.clear()
+
+
                 if self.lr_decay < 1:
                     self.scheduler.step()
 
-                if i != 0 and i % 8 == 0:
+                if i != 0 and i % 64 == 0:
                     self.save_snapshot(snapshot)
                     snapshot += 1
 
@@ -648,6 +699,9 @@ class AlphaRouterAgent(nn.Module):
 
         print(f"Success count: {self.success_count}")
         print(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}")
+        if curriculum_scheduler is not None:
+            print(f"Level log: {curriculum_scheduler.level_log}")
+            print(f"Final curriculum level: {curriculum_scheduler.current_level}")
 
         self._reset_test_envs()
         test_circuits = [env._state.interaction_circuit for env in self.test_vec_env.envs]
@@ -655,6 +709,12 @@ class AlphaRouterAgent(nn.Module):
 
         path = Path(self.log_dir.joinpath(get_timestamp() + '.txt'))
         self.dir_path = path
+
+        if save_model:
+            model_path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
+            torch.save(self.state_dict(), model_path)
+            print('Model saved successfully')
+
         with path.open('w', encoding='utf-8') as f:
             f.write(f'episodes: {total_timesteps}\n')
             f.write(f'Number of parameters: {sum(p.numel() for p in self.parameters() if p.requires_grad)}\n')
@@ -682,6 +742,9 @@ class AlphaRouterAgent(nn.Module):
             f.write(f'Test circuits: {test_circuits}')
             f.write(f"Success count: {self.success_count}\n")
             f.write(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}\n")
+            if curriculum_scheduler is not None:
+                f.write(f"Final curriculum level: {curriculum_scheduler.current_level}\n")
+                f.write(f"Curriculum level log: {curriculum_scheduler.level_log}\n")
             f.write(f'The training took: {end - start} seconds\n')
 
         if plot_graphs:
@@ -707,11 +770,6 @@ class AlphaRouterAgent(nn.Module):
         # plot(episodes, ma_loss_l1, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L1 per Episode {ma_window}-Episode MA')
         # plot(episodes, ma_loss_l2, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L2 per Episode {ma_window}-Episode MA')
         # plot(episodes, ma_returns, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Return', title='Return per episode 50-Episode MA')
-
-        if save_model:
-            path = MODEL_DIR.joinpath(f"model_{get_timestamp()}.pt")
-            torch.save(self.state_dict(), path)
-            print('Model saved successfully')
 
     def forward(self, env: Routing, plot: bool = False):
         state: RoutingState = env._state
@@ -794,10 +852,18 @@ if __name__ == '__main__':
     # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=BasicInteractionGenerator(max_length=30),
     #                          c_constant=2.4, d_model=40, num_layers=2, num_heads=4, embedding_dim=20, lr=0.0025,
     #                          device=device, episode_limit=100).to(device)
-    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=BasicInteractionGenerator(),
-                            c_constant=1.6254088840047858, d_model=29*5, num_layers=2, num_heads=5, embedding_dim=20,
-                            lookahead_length=32, lr=0.0004865268914714449,
-                              device=device, episode_limit=100).to(device)
+    # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=BasicInteractionGenerator(),
+    #                         c_constant=1.6254088840047858, d_model=29*5, num_layers=2, num_heads=5, embedding_dim=20,
+    #                         lookahead_length=32, lr=0.0004865268914714449,
+    #                           device=device, episode_limit=100).to(device)
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=None,
+                             c_constant=2.7006410144683506, d_model=6*5, num_layers=2, num_heads=5, embedding_dim=17,
+                             lookahead_length=32, lr=0.0031806603224105675,
+                               device=device, episode_limit=100).to(device)
+    # model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=None,
+    #                          c_constant=4.023975063062271, d_model=10 * 5, num_layers=3, num_heads=5, embedding_dim=26,
+    #                          lookahead_length=36, lr=0.0008965345771968207,
+    #                          device=device, episode_limit=100).to(device)
 
     ### LOAD AND RESUME TRAINING OF A SPECIFIC MODEL INSTEAD OF STARTING FROM SCRATCH???
     # path = MODEL_DIR.joinpath(f"model_2026-02-04T13-22-11-738563.pt")
@@ -807,8 +873,11 @@ if __name__ == '__main__':
 
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
+    curriculum_scheduler = CurriculumScheduler(start_level=1, max_level=10, inc_value=1, proceed_threshold=2.5,
+                                               retreat_threshold=3.5, cooldown=10, curriculum_generator=GateLengthCurriculumGenerator())
+
     start = time.time()
-    model.learn(12, batch=True, batch_size=64)
+    model.learn(100, batch=True, batch_size=64, curriculum_scheduler=curriculum_scheduler)
     end = time.time()
     print(f'It took: {end - start} seconds')
 

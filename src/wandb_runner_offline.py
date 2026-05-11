@@ -14,7 +14,7 @@ import torch
 import wandb
 
 from main import AlphaRouterAgent
-
+from src.curriculum_scheduler import CurriculumScheduler
 
 SEARCH_SPACE = {
     "c_constant": {"distribution": "log_uniform_values", "min": 1.0, "max": 5.0},
@@ -26,6 +26,8 @@ SEARCH_SPACE = {
     "lookahead_length": {"values": [32, 36, 40, 44, 48]},
     "batch_size": {"values": [32, 64]},
     "seed": {"values": [0, 1, 2, 42, 69, 2137]},
+    "curriculum_proceed_threshold": {"distribution": "uniform", "min": 1.5, "max": 4.0},
+    "curriculum_retreat_threshold": {"distribution": "uniform", "min": 10.0, "max": 15.0},
 }
 
 
@@ -130,8 +132,11 @@ def train_single_config(config: dict[str, Any], device: str = "cpu") -> None:
         )
 
         try:
-            agent.learn(400, batch_size=int(config["batch_size"]), plot_graphs=False, show_circuits=False,
-                        save_model=True)
+            curriculum = CurriculumScheduler(proceed_threshold=int(config["curriculum_proceed_threshold"]),
+                                             retreat_threshold=int(config["curriculum_retreat_threshold"]),
+                                             cooldown=15)
+            agent.learn(600, batch_size=int(config["batch_size"]), plot_graphs=False, show_circuits=False,
+                        save_model=True, curriculum_scheduler=curriculum)
             add_logs_as_artifact(run, getattr(agent, "dir_path", None))
         finally:
             del agent
@@ -209,4 +214,4 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    run_search(runs=args.runs, workers=args.workers, device=args.device, search_seed=args.search_seed)
+    run_search(runs=12, workers=6, device=args.device, search_seed=args.search_seed)
