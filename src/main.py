@@ -171,7 +171,6 @@ class AlphaRouterAgent(nn.Module):
         # self.env.rewarder = GridManhattanRewarder(5)
         self.reward = 0
         self.episode_limit = episode_limit  # The maximal number of steps in a single episode
-        self.success_count = 0  # How many times did we achieve a successful routing during the learning process
         self.loss_sum = 0
         self.lookahead_length = lookahead_length
         self.embedding_dim = embedding_dim
@@ -487,7 +486,6 @@ class AlphaRouterAgent(nn.Module):
                 if done[i]:
                     unfinished_test_indices.remove(i)
                     swaps[i] = step_idx + 1
-                    self.success_count += 1
                     continue
 
                 env = self.test_vec_env.envs[i]
@@ -496,7 +494,6 @@ class AlphaRouterAgent(nn.Module):
                 if done[i]:
                     unfinished_test_indices.remove(i)
                     swaps[i] = step_idx + 1
-                    self.success_count += 1
 
                 if not unfinished_test_indices:
                     break
@@ -588,11 +585,10 @@ class AlphaRouterAgent(nn.Module):
         losses = []
         swaps = []
         swap_lists = []
-        benchmark_swaps = 0
-        benchmark_swap_list = []
         returns = []
         losses_l1 = []
         losses_l2 = []
+        performances = []
         snapshot = 0
 
         print(f'### BENCHMARKING THE TEST CIRCUITS')
@@ -620,9 +616,12 @@ class AlphaRouterAgent(nn.Module):
                         and curriculum_scheduler is not None):
                     print(f'Running the test set (Episode: {i+1})...')
                     ep_swaps, ep_swap_list = self.test()
+                    performance = compute_performance(ep_swaps, benchmark_swaps)
+                    print(f"### PERFORMANCE: {performance}")
                 else:
                     ep_swaps = 0.0
                     ep_swap_list = []
+                    performance = 0.0
 
                 print(f'### BENCHMARK mean_swaps: {benchmark_swaps}')
                 print(f'### BENCHMARK swaps: {benchmark_swap_list}')
@@ -650,7 +649,8 @@ class AlphaRouterAgent(nn.Module):
                             "l2": l2,
                             "swaps": ep_swaps,
                             "swap_list": ep_swap_list,
-                            "curriculum_level": curriculum_scheduler.current_level
+                            "curriculum_level": curriculum_scheduler.current_level,
+                            "performance": performance
                         })
 
                 swaps.append(ep_swaps)
@@ -658,11 +658,10 @@ class AlphaRouterAgent(nn.Module):
                 losses.append(loss)
                 losses_l1.append(l1)
                 losses_l2.append(l2)
+                performances.append(performance)
 
                 if ((len(self.replay_buffer.buffer) > REPLAY_BUFFER_MIN_SIZE_MCTS or (len(self.unfinished_indices) == 0))
                         and curriculum_scheduler is not None):
-                    performance = compute_performance(ep_swaps, benchmark_swaps)
-                    print(f"### PERFORMANCE: {performance}")
                     force_update = len(self.unfinished_indices) == 0 and len(self.replay_buffer.buffer) < batch_size
                     if curriculum_scheduler.update_schedule(performance, force_update):
                         print(f"### CURRICULUM UPDATED")
@@ -697,8 +696,6 @@ class AlphaRouterAgent(nn.Module):
         # ma_loss_l2 = moving_average(losses_l2, window=ma_window)
         # ma_returns = moving_average(returns, window=ma_window)
 
-        print(f"Success count: {self.success_count}")
-        print(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}")
         if curriculum_scheduler is not None:
             print(f"Level log: {curriculum_scheduler.level_log}")
             print(f"Final curriculum level: {curriculum_scheduler.current_level}")
@@ -739,9 +736,8 @@ class AlphaRouterAgent(nn.Module):
             # f.write(f'ma_loss_l2: {ma_loss_l2}\n')
             f.write(f'swap_lists: {swap_lists}\n')
             f.write(f'benchmark_swap_lists: {benchmark_swap_list}\n')
-            f.write(f'Test circuits: {test_circuits}')
-            f.write(f"Success count: {self.success_count}\n")
-            f.write(f"Success %: {self.success_count / (N_ENVS * total_timesteps) * 100}\n")
+            f.write(f'Test circuits: {test_circuits}\n')
+            f.write(f'Performances: {performances}\n')
             if curriculum_scheduler is not None:
                 f.write(f"Final curriculum level: {curriculum_scheduler.current_level}\n")
                 f.write(f"Curriculum level log: {curriculum_scheduler.level_log}\n")
