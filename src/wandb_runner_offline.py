@@ -24,10 +24,10 @@ SEARCH_SPACE = {
     "num_layers": {"values": [2, 3, 4]},
     "d_model_const": {"distribution": "int_uniform", "min": 4, "max": 36},
     "lookahead_length": {"values": [32, 36, 40, 44, 48]},
-    "batch_size": {"values": [32, 64]},
+    # "batch_size": {"values": [32, 64]},
     "seed": {"values": [0, 1, 2, 42, 69, 2137]},
-    "curriculum_proceed_threshold": {"distribution": "uniform", "min": 1.5, "max": 4.0},
-    "curriculum_retreat_threshold": {"distribution": "uniform", "min": 10.0, "max": 15.0},
+    "curriculum_proceed_threshold": {"distribution": "uniform", "min": 1.5, "max": 2.5},
+    "curriculum_retreat_threshold": {"distribution": "uniform", "min": 4.0, "max": 6.0},
 }
 
 
@@ -132,10 +132,10 @@ def train_single_config(config: dict[str, Any], device: str = "cpu") -> None:
         )
 
         try:
-            curriculum = CurriculumScheduler(proceed_threshold=int(config["curriculum_proceed_threshold"]),
-                                             retreat_threshold=int(config["curriculum_retreat_threshold"]),
-                                             cooldown=15)
-            agent.learn(600, batch_size=int(config["batch_size"]), plot_graphs=False, show_circuits=False,
+            curriculum = CurriculumScheduler(proceed_threshold=float(config["curriculum_proceed_threshold"]),
+                                             retreat_threshold=float(config["curriculum_retreat_threshold"]),
+                                             cooldown=20, max_level=100)
+            agent.learn(1200, batch_size=64, plot_graphs=True, show_circuits=False,
                         save_model=True, curriculum_scheduler=curriculum)
             add_logs_as_artifact(run, getattr(agent, "dir_path", None))
         finally:
@@ -200,11 +200,11 @@ def run_search(runs: int, workers: int, device: str, search_seed: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Offline hyperparameter search for DelftBlue + W&B logging.")
-    parser.add_argument("--runs", type=int, default=36, help="Total number of sampled configurations to evaluate.")
+    parser.add_argument("--runs", type=int, default=6, help="Total number of sampled configurations to evaluate.")
     parser.add_argument(
         "--workers",
         type=int,
-        default=max(1, os.cpu_count() or 1),
+        default=2,
         help="Maximum number of concurrent training processes.",
     )
     parser.add_argument("--device", type=str, default="cpu", help="Torch device string, e.g. cpu or cuda:0.")
@@ -214,4 +214,4 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    run_search(runs=12, workers=6, device=args.device, search_seed=args.search_seed)
+    run_search(runs=args.runs, workers=args.workers, device=args.device, search_seed=args.search_seed)
