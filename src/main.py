@@ -3,6 +3,7 @@ import sys
 import time
 from collections import deque
 from copy import deepcopy
+from os import mkdir
 from pathlib import Path
 from typing import Optional
 
@@ -63,6 +64,7 @@ TEMP_BUFFER_DIR = TEMP_MODEL_DIR.joinpath('buffers/')
 TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
 TEMP_EMBEDDING_DIR = TEMP_MODEL_DIR.joinpath('temp_embedding.pt')
 LOG_DIR = Path(__file__).resolve().parent.joinpath('../logs/')
+PLOT_DIR = Path(__file__).resolve().parent.joinpath('../plots/')
 
 
 def make_env(connection_graph, interaction_generator: InteractionGenerator = None, lookahead_length: int = LOOKAHEAD_LENGTH
@@ -230,6 +232,7 @@ class AlphaRouterAgent(nn.Module):
         TEMP_MODEL_DIR.mkdir(parents=True, exist_ok=True)
         TEMP_BUFFER_DIR.mkdir(parents=True, exist_ok=True)
         LOG_DIR.mkdir(parents=True, exist_ok=True)
+        PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
         print('Init successful')
 
@@ -704,7 +707,9 @@ class AlphaRouterAgent(nn.Module):
         test_circuits = [env._state.interaction_circuit for env in self.test_vec_env.envs]
         circuit_lengths = [len(test_circuit) for test_circuit in test_circuits]
 
-        path = Path(self.log_dir.joinpath(get_timestamp() + '.txt'))
+        timestamp = get_timestamp()
+
+        path = Path(self.log_dir.joinpath(timestamp + '.txt'))
         self.dir_path = path
 
         if save_model:
@@ -743,24 +748,27 @@ class AlphaRouterAgent(nn.Module):
                 f.write(f"Curriculum level log: {curriculum_scheduler.level_log}\n")
             f.write(f'The training took: {end - start} seconds\n')
 
+        episodes = range(1, total_timesteps + 1)
+
+        plot_dir = PLOT_DIR.joinpath(f'{timestamp}/')
+        mkdir(plot_dir)
+
+        plot(episodes, swaps, label='Swaps per Episode', xlabel='Episode', ylabel='Swaps', title='Swaps per Episode', show=plot_graphs, path=plot_dir.joinpath(f'Swaps_per_episode_{timestamp}.png'))
+        plot(episodes, losses, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss per Episode', show=plot_graphs, path=plot_dir.joinpath(f'Loss_per_episode_{timestamp}.png'))
+        plot(episodes, losses_l1, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss L1 per Episode', show=plot_graphs, path=plot_dir.joinpath(f'l1_per_episode_{timestamp}.png'))
+        plot(episodes, losses_l2, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss L2 per Episode', show=plot_graphs, path=plot_dir.joinpath(f'l2_per_episode_{timestamp}.png'))
+        # plot(episodes, returns, label=f'Returns per episode', xlabel='Episode', ylabel='Return', title='Returns per episode')
+        plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title=f'Swaps per episode {ma_window}-Episode MA', show=plot_graphs, path=plot_dir.joinpath(f'Swaps_per_episode_{ma_window}_MA_{timestamp}.png'))
+        plot(episodes, ma_loss, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Loss', title=f'Loss per Episode {ma_window}-Episode MA', show=plot_graphs, path=plot_dir.joinpath(f'Loss_per_episode_{ma_window}_MA_{timestamp}.png'))
+
+        circuits = range(N_ENVS)
+
+        plot_subplots_2scales(circuits, [swap_lists[-1], benchmark_swap_list], [circuit_lengths],
+                      labels1=['AlphaRouter (final agent)', 'SABRE'], labels2=['Circuit length'],
+                      xlabel='Circuit idx', ylabel1='Swaps', ylabel2='Gates', title='Swaps per Circuit',
+                      show=plot_graphs, path=plot_dir.joinpath(f'Swaps_per_circuit_{timestamp}.png'))
+
         if plot_graphs:
-
-            episodes = range(1, total_timesteps + 1)
-
-            plot(episodes, swaps, label='Swaps per Episode', xlabel='Episode', ylabel='Swaps', title='Swaps per Episode')
-            plot(episodes, losses, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss per Episode')
-            plot(episodes, losses_l1, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss L1 per Episode')
-            plot(episodes, losses_l2, label='Loss per Episode', xlabel='Episode', ylabel='Loss', title='Loss L2 per Episode')
-            # plot(episodes, returns, label=f'Returns per episode', xlabel='Episode', ylabel='Return', title='Returns per episode')
-            plot(episodes, ma_swaps, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Swaps', title=f'Swaps per episode {ma_window}-Episode MA')
-            plot(episodes, ma_loss, label=f'{ma_window}-Episode Moving Avg', xlabel='Episode', ylabel='Loss', title=f'Loss per Episode {ma_window}-Episode MA')
-
-            circuits = range(N_ENVS)
-
-            plot_subplots_2scales(circuits, [swap_lists[-1], benchmark_swap_list], [circuit_lengths],
-                          labels1=['AlphaRouter (final agent)', 'SABRE'], labels2=['Circuit length'],
-                          xlabel='Circuit idx', ylabel1='Swaps', ylabel2='Gates', title='Swaps per Circuit')
-
             for i, env in enumerate(self.test_vec_env.envs):
                 render_rgb(env, title=f'Test circuit #{i}')
         # plot(episodes, ma_loss_l1, label=f'{ma_window}-Episode Moving Avg', xlabel='Game', ylabel='Loss', title=f'Loss L1 per Episode {ma_window}-Episode MA')
@@ -860,6 +868,10 @@ if __name__ == '__main__':
     #                          c_constant=4.023975063062271, d_model=10 * 5, num_layers=3, num_heads=5, embedding_dim=26,
     #                          lookahead_length=36, lr=0.0008965345771968207,
     #                          device=device, episode_limit=100).to(device)
+    model = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=None,
+                             c_constant=1.2217286199661843, d_model=17 * 5, num_layers=3, num_heads=5, embedding_dim=31,
+                             lookahead_length=44, lr=0.00031907082400580507,
+                             device=device, episode_limit=100).to(device)
 
     ### LOAD AND RESUME TRAINING OF A SPECIFIC MODEL INSTEAD OF STARTING FROM SCRATCH???
     # path = MODEL_DIR.joinpath(f"model_2026-02-04T13-22-11-738563.pt")
@@ -869,11 +881,14 @@ if __name__ == '__main__':
 
     print(f'Number of model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 
-    curriculum_scheduler = CurriculumScheduler(start_level=1, max_level=10, inc_value=1, proceed_threshold=2.5,
-                                               retreat_threshold=3.5, cooldown=10, curriculum_generator=GateLengthCurriculumGenerator())
+    # curriculum_scheduler = CurriculumScheduler(start_level=1, max_level=100, inc_value=1, proceed_threshold=3.4,
+    #                                            retreat_threshold=8.6, cooldown=15, curriculum_generator=GateLengthCurriculumGenerator())
+    curriculum_scheduler = CurriculumScheduler(start_level=1, max_level=100, inc_value=1, proceed_threshold=2.5,
+                                               retreat_threshold=5.0, cooldown=20,
+                                               curriculum_generator=GateLengthCurriculumGenerator())
 
     start = time.time()
-    model.learn(100, batch=True, batch_size=64, curriculum_scheduler=curriculum_scheduler)
+    model.learn(1200, batch=True, batch_size=64, curriculum_scheduler=curriculum_scheduler)
     end = time.time()
     print(f'It took: {end - start} seconds')
 

@@ -8,7 +8,7 @@ import math
 from collections import deque
 
 
-def plot(x_axis, values, label, xlabel, ylabel, title):
+def plot(x_axis, values, label, xlabel, ylabel, title, show=True, path=None):
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(x_axis, values, label=label, linewidth=2)
     ax.set_xlabel(xlabel)
@@ -17,7 +17,10 @@ def plot(x_axis, values, label, xlabel, ylabel, title):
     ax.legend()
     ax.grid(True)
     plt.tight_layout()
-    plt.show()
+    if path is not None:
+        plt.savefig(path)
+    if show:
+        plt.show()
 
 def plot_subplots(x_axis, values_lists, labels, linestyle, xlabel, ylabel, title):
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -35,7 +38,8 @@ def plot_subplots(x_axis, values_lists, labels, linestyle, xlabel, ylabel, title
     return fig, ax
 
 
-def plot_subplots_2scales(x_axis, values_lists1, values_lists2, labels1, labels2, xlabel, ylabel1, ylabel2, title):
+def plot_subplots_2scales(x_axis, values_lists1, values_lists2, labels1, labels2, xlabel, ylabel1, ylabel2, title,
+                          show = True, path=None):
     fig, ax = plt.subplots(figsize=(12, 6))
 
     for values, label in zip(values_lists1, labels1):
@@ -54,7 +58,11 @@ def plot_subplots_2scales(x_axis, values_lists1, values_lists2, labels1, labels2
     ax.grid(True)
 
     plt.tight_layout()
-    plt.show()
+
+    if path is not None:
+        plt.savefig(path)
+    if show:
+        plt.show()
 
     return fig, ax
 
@@ -485,7 +493,7 @@ def plot_mcts_tree(
     return fig
 
 
-def render_rgb(env, title=None):
+def render_rgb(env, title=None, show=True, path=None):
     """Convenience method that we will use later on to display our results. Copied from notebooks"""
     if title is None:
         title = f"Step {env._state.steps_done}"
@@ -496,4 +504,7 @@ def render_rgb(env, title=None):
     except IndexError:
         plt.imshow(env.render())
     plt.axis("off")
-    plt.show()
+    if path is not None:
+        plt.savefig(path)
+    if show:
+        plt.show()
