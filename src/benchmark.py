@@ -8,6 +8,18 @@ from qiskit.transpiler.passes import SabreSwap, SetLayout, ApplyLayout, BasicSwa
 
 
 def _env_to_coupling_map(env: Env) -> tuple[CouplingMap, int]:
+    """
+    Convert the connection graph of the env from gym API to CouplingMap from qiskit API.
+    Parameters
+    ----------
+    env - the environment of the routing problem
+
+    Returns
+    -------
+    tuple consisting of:
+        * coupling_map - connection graph translated to qiskit API so that the baseline can be run
+        * number of physical qubits
+    """
     state: RoutingState = env._state
     graph = state.connection_graph
 
@@ -21,6 +33,16 @@ def _env_to_coupling_map(env: Env) -> tuple[CouplingMap, int]:
     return coupling_map, graph.number_of_nodes()
 
 def _env_to_circuit(env: Env, num_qubits) -> QuantumCircuit:
+    """
+    Convert the interaction graph of the env from qgym API to CouplingMap from qiskit API.
+    Parameters
+    ----------
+    env - the environment of the routing problem
+
+    Returns
+    -------
+    interaction graph translated to qiskit API so that the baseline can be run
+    """
     state: RoutingState = env._state
     interaction_graph = state.interaction_circuit
 
@@ -31,7 +53,23 @@ def _env_to_circuit(env: Env, num_qubits) -> QuantumCircuit:
 
     return qc
 
-def run_benchmark(env: Env, seed: int | None = 42, backend: str = 'SABRE', pass_manager: PassManager = None) -> tuple[QuantumCircuit, QuantumCircuit]:
+def run_benchmark(env: Env, seed: int | None = 42, baseline: str = 'SABRE', pass_manager: PassManager = None) -> tuple[QuantumCircuit, QuantumCircuit]:
+    """
+    Run the given qiskit baseline with the given environment and seed. A custom pass manager can be supplied.
+    Parameters
+    ----------
+    env - environment of the routing problem
+    seed - seed of the benchmark
+    baseline - type of the baseline to run ('SABRE', 'basic')
+    pass_manager - qiskit's manager of compilation passes. If none, a default one is constructed.
+        See qiskit API documentation for more details.
+
+    Returns
+    -------
+    a tuple consisting of:
+        * the problem circuit to be routed
+        * the output of the routing algorithm
+    """
     if pass_manager is None:
         pass_manager = PassManager()
 
@@ -47,7 +85,7 @@ def run_benchmark(env: Env, seed: int | None = 42, backend: str = 'SABRE', pass_
 
     circuit = _env_to_circuit(env, num_qubits)
 
-    match backend.lower():
+    match baseline.lower():
         case "sabre":
             pass_manager.append(SabreSwap(coupling_map, trials=8, fake_run=False))
         case 'basic':
@@ -57,8 +95,27 @@ def run_benchmark(env: Env, seed: int | None = 42, backend: str = 'SABRE', pass_
 
     return circuit, pass_manager.run(circuit)
 
-def benchmark(env: Env, seed: int | None = 42, backend: str = 'SABRE', show_circuits: bool = False) -> int:
-    initial_circuit, routed_circuit = run_benchmark(env, seed=seed, backend=backend)
+def benchmark(env: Env, seed: int | None = 42, baseline: str = 'SABRE', show_circuits: bool = False) -> int:
+    """
+    Runs the benchmark and computes statistics.
+    Uses the given qiskit baseline with the given environment and seed.
+
+    Parameters
+    ----------
+    env - environment of the routing problem
+    seed - seed of the benchmark
+    baseline - type of the baseline to run ('SABRE', 'basic')
+    show_circuits - if true, the following information will be printed:
+        * initial problem circuit to be solved
+        * the circuit after the routing
+        * a dict of instructions in the initial circuit
+        * a dict of instructions in the circuit after the routing
+
+    Returns
+    -------
+    the number of swap gates inserted by the baseline algorithm
+    """
+    initial_circuit, routed_circuit = run_benchmark(env, seed=seed, baseline=baseline)
 
     routed_ops = routed_circuit.count_ops()
 

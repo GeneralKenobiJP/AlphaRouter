@@ -2,7 +2,20 @@ import networkx as nx
 import numpy as np
 from qgym.envs.routing import RoutingState, BasicRewarder
 
-def _manhattan_distance(state: RoutingState, cache):
+def _manhattan_distance(state: RoutingState, cache) -> int:
+    """
+    Calculates Manhattan distance between the qubits of the gate that is currently to be routed.
+    Uses cache so that the distance between any 2 qubits needs to be calculated only once.
+
+    Parameters
+    ----------
+    state - state of the environment
+    cache - distance cache
+
+    Returns
+    -------
+    Manhattan distance between two qubits that are to be routed now.
+    """
     q1, q2 = state.interaction_circuit[state.position]
 
     p1 = state.mapping[q1]
@@ -19,6 +32,9 @@ def _manhattan_distance(state: RoutingState, cache):
 
 
 class ManhattanRewarder(BasicRewarder):
+    """
+    This rewarder gives the bigger penalty the longer the manhattan distance between 2 qubits of the gate to be routed is.
+    """
 
     def __init__(self, n_qubits):
         super().__init__()
@@ -33,31 +49,3 @@ class ManhattanRewarder(BasicRewarder):
         new_state: RoutingState,
     ) -> float:
         return - _manhattan_distance(new_state, self.distance_cache) + _manhattan_distance(old_state, self.distance_cache)
-        # interaction_circuit = new_state.interaction_circuit
-        # if len(interaction_circuit) < 1:
-        #     return 0
-        # return -np.abs(new_state.mapping[interaction_circuit[0][0]] - new_state.mapping[interaction_circuit[0][1]])
-
-class GridManhattanRewarder(BasicRewarder):
-
-    def __init__(self, width: int):
-        super().__init__()
-        self.n = width
-
-    def compute_reward(
-        self,
-        *,
-        old_state: RoutingState,
-        action: int,
-        new_state: RoutingState,
-    ) -> float:
-        interaction_circuit = new_state.interaction_circuit
-        if len(interaction_circuit) < 1:
-            return 0
-        q = new_state.mapping[interaction_circuit[0][0]]
-        p = new_state.mapping[interaction_circuit[0][1]]
-        n1 = q % self.n
-        n2 = p % self.n
-        m1 = q / self.n
-        m2 = p / self.n
-        return - (np.abs(n2-n1) + np.abs(m2-m1))

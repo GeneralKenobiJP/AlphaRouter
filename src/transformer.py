@@ -47,24 +47,25 @@ class TransformerLayer(nn.Module):
     - Feed-forward network
     - Add & norm layer
     """
-    def __init__(self, embedding_dim, num_heads, ffn_dim):
+    def __init__(self, d_model, num_heads, ffn_dim):
         """
-        :param embedding_dim: Embedding dimension of the node embeddings
+        :param d_model: internal feature width after input projection, d_model = num_heads * d_head
+            (embedding dimension for the multihead attention)
         :param num_heads: Number of heads in a multihead attention layer
         :param ffn_dim: Dimensionality of the hidden layer in the feed forward layer
         """
         super().__init__()
 
-        self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
-        self.norm1 = nn.LayerNorm(embedding_dim)
+        self.multihead_attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(embedding_dim, ffn_dim),
+            nn.Linear(d_model, ffn_dim),
             nn.ReLU(),
-            nn.Linear(ffn_dim, embedding_dim)
+            nn.Linear(ffn_dim, d_model)
         )
-        self.norm2 = nn.LayerNorm(embedding_dim)
+        self.norm2 = nn.LayerNorm(d_model)
 
-    def forward(self, x):
+    def forward(self, x) -> Tensor:
         """
         Applies the transformer layer
         :param x: input tensor
@@ -76,7 +77,21 @@ class TransformerLayer(nn.Module):
         return x
 
 
-def choose_actions(logits, sample=True) -> (Tensor, Tensor, Tensor):
+def choose_actions(logits: Tensor, sample: bool = True) -> tuple[Tensor, Tensor]:
+    """
+    Given logits and the policy choice (deterministic or probabilistic),
+    choose an action.
+
+    Parameters
+    ----------
+    logits
+    sample - if True, the action is sampled according to the distribution of the tensors (the sample is the index),
+            if False, always takes argmax
+
+    Returns
+    -------
+    An action chosen from the given logits.
+    """
     # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
     log_probs: Tensor = torch.log_softmax(logits, dim=-1)
 
@@ -99,10 +114,12 @@ class Transformer(nn.Module):
         """
         :param embedding_dim: Embedding dimension of the node embeddings (with the padding and depth)
         :param num_heads: Number of heads in a multihead attention layer
+        :param d_model: internal feature width after input projection, d_model = num_heads * d_head
         :param ffn_dim: Dimensionality of the hidden layer in the feed forward layer
         :param num_layers: Number of transformer layers
         :param lookahead_length: The maximal number of the gates ahead that we will analyze
         :param swap_options: Number of possible swaps actions + 1 (to include no swap)
+        :param device: The device on which the model is run
         """
         super().__init__()
 
@@ -158,14 +175,11 @@ class Transformer(nn.Module):
         nn.init.zeros_(self.decoder.bias)
         nn.init.normal_(self.value_head.weight, 0.0, 1e-3)
 
-        # print(f'Transformer parameters initialised to {self.state_dict()}')
-
-    def forward(self, x):
+    def forward(self, x) -> Tensor:
         """
-        Pads the input accordingly, applies the transformer encoder and linear decoder
+        Applies the transformer encoder and linear decoder
         :param x: input tensor
         """
-        # with autocast(self.device.type):
         x = self.input_projection(x)
 
         x = self.positional_encoding(x)

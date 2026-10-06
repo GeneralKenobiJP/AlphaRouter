@@ -1,3 +1,7 @@
+### This is an ONLINE wandb runner, which leverages the entire weights & biases functionality
+### automating hyperparameter search.
+### Use it only LOCALLY or on clusters that have COMPUTING NODES WITH INTERNET CONNECTION
+
 import random
 from pathlib import Path
 
@@ -5,9 +9,8 @@ import networkx as nx
 import numpy as np
 import torch
 import wandb
-from custom_interaction_generator import CustomInteractionGenerator
 
-from main import AlphaRouterAgent
+from router import AlphaRouterAgent
 
 import gc
 import multiprocessing as mp
@@ -15,6 +18,9 @@ import multiprocessing as mp
 from src.curriculum_scheduler import CurriculumScheduler
 from utils import clear_terminal
 
+# Config for the hyperparameter search
+# See wandb documentation for more info
+# (https://docs.wandb.ai/models/sweeps/define-sweep-configuration#python-script-or-notebook-2)
 sweep_config = {
     "method": "bayes",
     "metric": {"name": "swaps", "goal": "minimize"},
@@ -84,7 +90,17 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def train(connection_graph, interaction_generator=None, device="cpu"):
+def train(connection_graph, interaction_generator=None, device="cpu") -> None:
+    """
+    Trains a single agent instance.
+    Synchronizes the results with Weighs & Biases (wandb)
+
+    Parameters
+    ----------
+    connection_graph - qubit topology
+    interaction_generator - circuit generator (if None, then a BasicInteractionGenerator is used)
+    device - cpu or cuda, etc.
+    """
     with wandb.init() as run:
         run_dir = Path(run.dir)  # per-run directory  :contentReference[oaicite:5]{index=5}
 
@@ -123,22 +139,57 @@ def train(connection_graph, interaction_generator=None, device="cpu"):
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-def train_subprocess(connection_graph, interaction_generator=None, device="cpu"):
-    ctx = mp.get_context("spawn")  # important (esp. on CUDA)
-    training_process = ctx.Process(target=train, args=(connection_graph, interaction_generator, device))
-    training_process.start()
-    training_process.join()
-    if training_process.exitcode != 0:
-        raise RuntimeError(f"train() subprocess failed with exit code {training_process.exitcode}")
+# def train_subprocess(connection_graph, interaction_generator=None, device="cpu"):
+#     """
+#     Trains a single agent instance as a child process.
+#     Synchronizes the results with Weighs & Biases (wandb).
+#
+#     Raises a runtime error if the subproccess exited unexpectedly.
+#
+#     Parameters
+#     ----------
+#     connection_graph - qubit topology
+#     interaction_generator - circuit generator (if None, then a BasicInteractionGenerator is used)
+#     device - cpu or cuda, etc.
+#     """
+#     ctx = mp.get_context("spawn")  # important (esp. on CUDA)
+#     training_process = ctx.Process(target=train, args=(connection_graph, interaction_generator, device))
+#     training_process.start()
+#     training_process.join()
+#     if training_process.exitcode != 0:
+#         raise RuntimeError(f"train() subprocess failed with exit code {training_process.exitcode}")
 
-def _run_agent(sweep_id, connection_graph, interaction_generator, device, runs):
+def _run_agent(sweep_id, connection_graph, interaction_generator, device, runs) -> None:
+    """
+    Trains a single agent instance.
+    Synchronizes the results with Weighs & Biases (wandb)
+
+    Parameters
+    ----------
+    sweep_id - wandb id of the sweep
+    connection_graph - qubit topology
+    interaction_generator - circuit generator (if None, then a BasicInteractionGenerator is used)
+    device - cpu or cuda, etc.
+    runs - the number of config sweeps (trials) to run
+    """
     wandb.agent(
         sweep_id,
         function=lambda: train(connection_graph, interaction_generator, device),
         count=runs,
     )
 
-def run_sweep(connection_graph, interaction_generator=None, runs=25, processes=1, device="cpu"):
+def run_sweep(connection_graph, interaction_generator=None, runs=25, processes=1, device="cpu") -> None:
+    """
+    Performs the (possibly) parallelized hyperparameter search.
+
+    Parameters
+    ----------
+    connection_graph - qubit topology
+    interaction_generator - circuit generator (if None, then a BasicInteractionGenerator is used)
+    runs - the number of config sweeps (trials) to run
+    processes - number of concurrent processes to use at any given moment.
+    device - cpu or cuda, etc.
+    """
     sweep_id = wandb.sweep(sweep=sweep_config, project="alpharouter")
 
     runs_per_agent = runs // processes
@@ -158,5 +209,3 @@ if __name__ == "__main__":
     interaction_generator = None
 
     run_sweep(connection_graph, interaction_generator=interaction_generator, runs=4, processes=4)
-
-#todo: make episode limit depend on qubit count

@@ -11,7 +11,7 @@ from qgym.generators import BasicInteractionGenerator
 from torch import nn, Tensor, tensor
 
 from custom_interaction_generator import CustomInteractionGenerator
-from main import ReplayBuffer, ManhattanRewarder, AlphaRouterAgent, \
+from router import ReplayBuffer, ManhattanRewarder, AlphaRouterAgent, \
     LOOKAHEAD_LENGTH
 from mcts import MCTS, gen_hash, MCTSWorker, inference_loop, Node, ParallelMCTS
 from transformer import PositionalEncoding, TransformerLayer, Transformer

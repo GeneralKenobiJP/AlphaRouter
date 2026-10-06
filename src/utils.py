@@ -6,19 +6,23 @@ import os
 from collections import deque
 from pathlib import Path
 from sys import platform
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Any
 
 import numpy as np
 import torch
 from gymnasium import Wrapper
 from qgym.envs import Routing
 from qgym.envs.routing import RoutingState
+from qgym.templates.state import ObservationT
 from torch import nn, Tensor
 from torch.types import Device
 
 
 def _make_python_safe(obj):
-    """Convert common non-Python-native types into plain Python types."""
+    """
+    Convert common non-Python-native types into plain Python types.
+    This was needed for environments to work when they compute an information dict
+    """
     if obj is None:
         return None
     if isinstance(obj, deque):
@@ -86,14 +90,6 @@ def embed_nodes(state: RoutingState, lookahead_length: int, device: Device, qubi
     :return: Node embedding
     """
     interaction_circuit = state.interaction_circuit[:lookahead_length]  # Limit lookahead depth
-
-    # w = getattr(qubit_embedding, "weight", None)
-    # print(f'qubit embedding weight: {w}')
-    # if w is not None:
-    #     try:
-    #         print(f"[weight device: {w.device}, shape: {w.shape}, sum: {float(w.sum()):.6f}")
-    #     except Exception as e:
-    #         print(f"could not inspect weight: {e}")
 
     # Pre-generate physical qubit embeddings
     phys_qubits = torch.arange(state.n_qubits, dtype=torch.long, device=device)
@@ -163,7 +159,19 @@ def compare_routing_states(state1: RoutingState, state2: RoutingState) -> bool:
 
     return True
 
-def surpass_gate_if_possible(state: RoutingState):
+def surpass_gate_if_possible(state: RoutingState) -> bool:
+    """
+    For the given state, if the gate can be surpassed because its qubits are adjacent,
+    surpass the gate and alter the state accordingly.
+
+    Parameters
+    ----------
+    state - the RoutingState to check for possible surpassing
+
+    Returns
+    -------
+    True if a gate was surpassed, False otherwise (meaning the state is either done or no surpass is possible).
+    """
     if state.is_done():
         return False
 
@@ -174,13 +182,51 @@ def surpass_gate_if_possible(state: RoutingState):
     return False
 
 def surpass_all_possible_gates(state: RoutingState):
+    """
+    For the given state, surpass all possible gates that can be surpassed because their qubits are adjacent.
+    The state is altered so that it either is terminal or does not allow for further surpassing.
+
+    Parameters
+    ----------
+    state - the state to check for possible surpassing
+    """
     while surpass_gate_if_possible(state):
         pass
 
 def env_surpass_all_possible_gates(env: Routing):
+    """
+    For the state of the given routing environment, surpass all possible gates that can be surpassed because their qubits are adjacent.
+    The state is altered so that it either is terminal or does not allow for further surpassing.
+
+    Parameters
+    ----------
+    env - the environment whose state we want to check for possible surpassing
+    """
     surpass_all_possible_gates(env._state)
 
-def env_surpass_all_possible_gates_with_info(env: Routing, surpass_action):
+def env_surpass_all_possible_gates_with_info(env: Routing, surpass_action)\
+        -> tuple[ObservationT | None, float | None, bool, dict[Any, Any] | None]:
+    """
+    For the state of the given routing environment, surpass all possible gates that can be surpassed because their qubits are adjacent.
+    The state is altered so that it either is terminal or does not allow for further surpassing.
+
+    The surpassing is done via env.step() and so it produces all the transition information.
+    The function returns the information from the last surpass.
+
+    Parameters
+    ----------
+    env - the environment whose state we want to check for possible surpassing
+    surpass_action - the action index that causes the environment to surpass the gate (normally, the last possible action index)
+
+    Returns
+    -------
+    a tuple consisting of:
+    * observations
+    * reward
+    * done (terminated or truncated)
+    * info dict
+    None indicates that no surpass was possible or that the state is terminal.
+    """
     state: RoutingState = env._state
 
     if state.is_done():
@@ -212,25 +258,3 @@ def open_binary(path: Path, mode: str = 'rb', compress: Optional[str] = None):
 
 def get_timestamp():
     return str(datetime.datetime.now().isoformat()).replace(':', '-').replace('.', '-')
-
-# def _standard_reward(gates_routed: int, path_length: int) -> int:
-#     return gates_routed - path_length
-#
-# def standard_reward(path_states: list[RoutingState]) -> int:
-#     if len(path_states) <= 1:
-#         return 0
-#
-#     new_gates_routed = path_states[0].position - path_states[-1].position
-#
-#     return _standard_reward(new_gates_routed, len(path_states) - 1)
-#
-# def _ratio_reward(gates_routed: int, path_length: int) -> float:
-#     return gates_routed / path_length
-#
-# def ratio_reward(path_states: list[RoutingState]) -> float:
-#     if len(path_states) <= 1:
-#         return 0
-#
-#     new_gates_routed = path_states[0].position - path_states[-1].position
-#
-#     return _ratio_reward(new_gates_routed, len(path_states) - 1)

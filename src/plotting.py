@@ -7,6 +7,7 @@ from typing import Sequence, Tuple, Union, Optional, Iterable, Any
 import math
 from collections import deque
 
+### Warning: Many of these functions have been vibecoded
 
 def plot(x_axis, values, label, xlabel, ylabel, title, show=True, path=None):
     fig, ax = plt.subplots(figsize=(12, 6))

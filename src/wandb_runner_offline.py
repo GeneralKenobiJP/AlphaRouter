@@ -1,3 +1,9 @@
+### This is an OFFLINE wandb runner, which performs hyperparameter search by its own implementation,
+### and then syncs the results with wandb for visualisation and logging.
+### Use it whenever working on clusters that have COMPUTING NODES WITHOUT INTERNET CONNECTION.
+### This is probably not an efficient way to use wandb, as it doesn't leverage the hyperparameter search functionality,
+### there might be a library more suited for this use case.
+
 import argparse
 import gc
 import json
@@ -13,7 +19,7 @@ import numpy as np
 import torch
 import wandb
 
-from main import AlphaRouterAgent
+from router import AlphaRouterAgent
 from src.curriculum_scheduler import CurriculumScheduler
 
 SEARCH_SPACE = {
@@ -40,6 +46,10 @@ def set_seed(seed: int) -> None:
 
 
 def set_single_thread_runtime() -> None:
+    """
+    Ensures there is only 1 thread per process.
+    Probably not necessary.
+    """
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -55,6 +65,16 @@ def set_single_thread_runtime() -> None:
 
 
 def sample_config(rng: random.Random) -> dict[str, Any]:
+    """
+    Sample one hyperparameter configuration from the hyperparameter space.
+    Parameters
+    ----------
+    rng - seed generator
+
+    Returns
+    -------
+    A dictionary of hyperparameter values.
+    """
     cfg: dict[str, Any] = {}
 
     for key, spec in SEARCH_SPACE.items():
@@ -74,6 +94,13 @@ def sample_config(rng: random.Random) -> dict[str, Any]:
 
 
 def build_default_connection_graph() -> nx.Graph:
+    """
+    Build a small connection graph with 4 qubits and line topology.
+
+    Returns
+    -------
+    A connection graph
+    """
     graph = nx.Graph()
     graph.add_edges_from([(0, 1), (1, 2), (2, 3)])
     return graph
@@ -81,6 +108,24 @@ def build_default_connection_graph() -> nx.Graph:
 
 
 def add_logs_as_artifact(run: wandb.sdk.wandb_run.Run, path_like: str | os.PathLike[str] | None) -> None:
+    """
+    Store a file or directory of logs as a Weights & Biases Artifact.
+
+    A W&B Artifact is a versioned collection of files associated with a run,
+    commonly used to track outputs such as models, datasets, logs, or other
+    reproducibility-related files.
+
+    This function creates an Artifact named ``"run-logs-{run.id}"`` with type
+    ``"logs"`` and logs it as an output of ``run``.
+
+    If ``path_like`` points to a directory, all files in the directory are
+    added with ``Artifact.add_dir``. If it points to a single file, it is
+    added with ``Artifact.add_file``.
+
+    If ``path_like`` is ``None`` or does not exist, the function returns
+    without creating an Artifact.
+    """
+
     if path_like is None:
         return
 
@@ -96,8 +141,17 @@ def add_logs_as_artifact(run: wandb.sdk.wandb_run.Run, path_like: str | os.PathL
     run.log_artifact(artifact)
 
 
-
 def train_single_config(config: dict[str, Any], device: str = "cpu") -> None:
+    """
+    Trains a single agent instance from the given hyperparameter configuration.
+    Adds the log as a Weighs & Biases (wandb) artifact.
+    Uses a simple line topology with 4 qubits. #todo: make it accept arbitrary connection graphs
+
+    Parameters
+    ----------
+    config - a dictionary of hyperparameter values
+    device - cpu or cuda, etc.
+    """
     set_single_thread_runtime()
     set_seed(int(config["seed"]))
 
@@ -150,12 +204,29 @@ def train_single_config(config: dict[str, Any], device: str = "cpu") -> None:
 
 
 def _worker_entry(config_json: str, device: str) -> None:
+    """
+    Retrieves a hyperparameter configuration from json and trains a single agent.
+    
+    Parameters
+    ----------
+    config_json - json with the hyperparameter configuration
+    device - cpu or cuda, etc.
+    """
     config = json.loads(config_json)
     train_single_config(config=config, device=device)
 
 
-
 def run_search(runs: int, workers: int, device: str, search_seed: int) -> None:
+    """
+    Performs the (possibly) parallelized hyperparameter search.
+
+    Parameters
+    ----------
+
+    runs - the number of config sweeps (trials) to run
+    workers - number of concurrent processes to use at any given moment.
+    device - cpu or cuda, etc.
+    """
     if runs < 1:
         raise ValueError("runs must be at least 1")
     if workers < 1:
