@@ -1,5 +1,4 @@
 import networkx as nx
-import numpy as np
 from qgym.envs.routing import RoutingState, BasicRewarder
 
 def _manhattan_distance(state: RoutingState, cache) -> int:

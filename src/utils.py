@@ -14,7 +14,7 @@ from gymnasium import Wrapper
 from qgym.envs import Routing
 from qgym.envs.routing import RoutingState
 from qgym.templates.state import ObservationT
-from torch import nn, Tensor
+from torch import nn
 from torch.types import Device
 
 

@@ -6,7 +6,6 @@ from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 
-import numpy as np
 import torch.multiprocessing as mp
 from torch.multiprocessing import Process
 from queue import Queue

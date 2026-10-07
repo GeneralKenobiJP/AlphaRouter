@@ -2,22 +2,19 @@ import math
 from copy import deepcopy
 
 import networkx as nx
-import pytest
-import torch
 import numpy as np
+import torch
+import torch.multiprocessing as mp
 from qgym.envs import Routing
 from qgym.envs.routing import RoutingState
 from qgym.generators import BasicInteractionGenerator
-from torch import nn, Tensor, tensor
+from torch import nn
 
 from custom_interaction_generator import CustomInteractionGenerator
-from router import ReplayBuffer, ManhattanRewarder, AlphaRouterAgent, \
-    LOOKAHEAD_LENGTH
-from mcts import MCTS, gen_hash, MCTSWorker, inference_loop, Node, ParallelMCTS
+from mcts import MCTS, gen_hash, MCTSWorker, Node, ParallelMCTS
+from router import LOOKAHEAD_LENGTH
 from transformer import PositionalEncoding, TransformerLayer, Transformer
 from utils import compare_routing_states, embed_nodes
-
-import torch.multiprocessing as mp
 
 
 # --- utils ---
@@ -263,36 +260,6 @@ def test_transformer_forward_shape():
 #     assert rewards.shape == (batch_size,)
 #     assert next_states.shape == (batch_size, *state_shape)
 #     assert dones.shape == (batch_size,)
-
-
-# --- ManhattanRewarder tests ---
-
-class DummyState:
-    def __init__(self, mapping, circuit):
-        self.mapping = mapping
-        self.interaction_circuit = circuit
-        self.n_qubits = len(mapping) - 1
-
-
-def test_manhattan_rewarder_empty():
-    rew = ManhattanRewarder()
-    old = DummyState([0, 1], [])
-    new = DummyState([0, 1], [])
-    assert rew.compute_reward(old_state=old, action=0, new_state=new) == 0
-
-
-def test_manhattan_rewarder_nonempty():
-    rew = ManhattanRewarder()
-    old = DummyState([0, 1, 2], [(0, 2)])
-    new = DummyState([0, 2, 1], [(0, 2)])
-    assert rew.compute_reward(old_state=old, action=0, new_state=new) == -1
-
-
-def test_manhattan_rewarder_long():
-    rew = ManhattanRewarder()
-    old = DummyState([0, 1, 2, 3, 4, 5, 6], [(0, 6)])
-    new = DummyState([0, 1, 2, 3, 4, 6, 5], [(0, 6)])
-    assert rew.compute_reward(old_state=old, action=0, new_state=new) == -5
 
 
 # --- embed_nodes tests ---

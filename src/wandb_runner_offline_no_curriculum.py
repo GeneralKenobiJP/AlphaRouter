@@ -24,7 +24,6 @@ import torch
 import wandb
 
 from router import AlphaRouterAgent
-from src.curriculum_scheduler import CurriculumScheduler
 
 SEARCH_SPACE = {
     "c_constant": {"distribution": "log_uniform_values", "min": 1.0, "max": 5.0},
