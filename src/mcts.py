@@ -6,7 +6,6 @@ from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 
-import numpy as np
 import torch.multiprocessing as mp
 from torch.multiprocessing import Process
 from queue import Queue
@@ -14,38 +13,42 @@ from typing import Optional, List, Dict, Tuple
 
 import torch
 from qgym.envs.routing import RoutingState, BasicRewarder
-from torch import Tensor, nn, detach, NoneType
-from torch.amp import GradScaler, autocast
+from torch import Tensor, nn, detach
+from torch.amp import GradScaler
 from torch.nn import Embedding
 from torch.types import Device
-from tqdm import tqdm
 
 from manhattan_rewarder import ManhattanRewarder
-from plotting import plot_mcts_tree
-from transformer import Transformer
+from transformer import Transformer, choose_actions
 from utils import embed_nodes, boost_process_priority, compare_routing_states, \
     surpass_all_possible_gates
 
 mp.set_start_method("spawn", force=True)
 
-MODEL_DIR = Path(__file__).resolve().parent.joinpath('models/')
+MODEL_DIR = Path(__file__).resolve().parent.joinpath('../models/')
 TEMP_MODEL_DIR = MODEL_DIR.joinpath('temp/')
 TEMP_TRANSFORMER_DIR = TEMP_MODEL_DIR.joinpath('temp_transformer.pt')
 TEMP_EMBEDDING_DIR = TEMP_MODEL_DIR.joinpath('temp_embedding.pt')
 
-CHECKPOINT_PERIOD = 4
 
+def gen_hash(state: RoutingState) -> int:
+    """
+    Hashes the routing state.
 
-def gen_hash(state: RoutingState):
+    The in-built python hash function yields different outputs if run by different processes.
+    This hashing function is safe for multiprocessing.
+    """
     m = hashlib.sha256(usedforsecurity=False)
-    m.update(state.interaction_circuit[0].data.tobytes())
-    m.update(state.mapping.data.tobytes())
     m.update(str(state.n_qubits).encode())
     m.update(str(state.n_connections).encode())
+    m.update(state.interaction_circuit[state.position:].data.tobytes())
+    m.update(state.mapping.data.tobytes())
     return int(m.hexdigest(), 16)
-    # return hash( (state.interaction_circuit.data.tobytes(), state.mapping.data.tobytes()) )
 
 class Node:
+    """
+    An MCTS node
+    """
     def __init__(self, state: RoutingState):
         self.visits = 0
         self.value = 0
@@ -60,6 +63,9 @@ class Node:
         return self.state.is_done()
 
     def is_exhausted(self, swap_options: int) -> bool:
+        """
+        Given the possible number of swaps, can this node be further expanded or did it fully exhaust all swap options?
+        """
         return len(self.children) == swap_options
 
     def __hash__(self):
@@ -71,12 +77,6 @@ class Node:
     def __eq__(self, other):
         if not isinstance(other, Node):
             return False
-        # if self.visits != other.visits:
-        #     return False
-        # if not math.isclose(self.value, other.value):
-        #     return False
-        # if not self.children == other.children:
-        #     return False
         return compare_routing_states(self.state, other.state)
 
     def __reduce__(self):
@@ -85,6 +85,9 @@ class Node:
 
 
 class MCTS:
+    """
+    Single-process implementation of Monte Carlo Tree Search.
+    """
     def __init__(self, transformer: Transformer, qubit_embedding: nn.Embedding,
                  device: Device, swap_options: int, c: float = math.sqrt(2), rollouts: int = 200, max_depth: int = 100,
                  lookahead_length: int = 48, embedding_dim: int = 24, padding_dim: int = 3):
@@ -101,13 +104,15 @@ class MCTS:
         self.embedding_dim = embedding_dim
         self.padding_dim = padding_dim
         self.rewarder = BasicRewarder(illegal_action_penalty=0, penalty_per_swap=-1, reward_per_surpass=1)
-        self.checkpoint_period = CHECKPOINT_PERIOD
         self.partial_rewarder = ManhattanRewarder(self.swap_options + 1)
 
         self.qubit_embedding.to(self.device)
         self.transformer.to(self.device)
 
     def set_root(self, state: RoutingState) -> None:
+        """
+        Sets the given state as the rout of the search.
+        """
         surpass_all_possible_gates(state)
         hash = gen_hash(state)
         node = self.get_transposition(hash)
@@ -117,19 +122,71 @@ class MCTS:
         else:
             self.root = node
 
-    def ucb(self, root: Node, node: Node) -> float:
-        return (node.value / (node.visits + 1e-6) +
+    def ucb(self, parent: Node, node: Node) -> float:
+        """
+        Calculates the Upper Confidence Bound (UCB) of the given node.
+        If the node has not beed visited before, ucb returns infinity.
+
+        Parameters
+        ----------
+        parent - parent of the node
+        node - the node we want to calculate the UCB for
+
+        Returns
+        -------
+        UCB
+        """
+        if node.visits == 0:
+            return float("inf")
+
+        return (node.value / node.visits +
                 self.c_constant * math.sqrt(
-                    math.log(root.visits + 1 + 1e-6) / (node.visits + 1e-6)
+                    math.log(parent.visits) / node.visits
                 ))
 
-    def select_child(self, root: Node, path_states: List[RoutingState] = None) -> (Node, int):
-        max_child = max(root.children.keys(),
-                        key=lambda child: -math.inf if child.state in path_states else self.ucb(root, child))
-        action = root.children[max_child]
+    def select_child(self, parent: Node, path_states: List[RoutingState] = None) -> tuple[Node, int]:
+        """
+        Selects the child node with the highest UCB.
+        For all child states that have been visited before this rollout (transpositions - the same state can be reached in multiple distinct ways),
+        the ucb is overriden to -infinity to avoid infinite cycles.
+
+        Parameters
+        ----------
+        parent - the parent node
+        path_states - the list of states selected so far during the rollout
+
+        Returns
+        -------
+        a tuple consisting of:
+         * the child node selected
+         * the action needed to be selected at the parent node to arrive at the child node
+        """
+        max_child = max(parent.children.keys(),
+                        key=lambda child: -math.inf if child.state in path_states else self.ucb(parent, child))
+        action = parent.children[max_child]
         return max_child, action
 
-    def select(self, root: Node) -> (Node, bool, list[RoutingState], list[int]):
+    def select(self, root: Node) -> tuple[Node | None, bool, list[RoutingState], list[int]]:
+        """
+        Performs the selection phase of the MCTS rollout.
+        Iterates through the tree, selecting the child node with the highest UCB,
+        until a terminal or not fully expanded node is encountered.
+
+        Parameters
+        ----------
+        root - the root node of the search
+
+        Returns
+        -------
+        a tuple consisting of:
+        * the final node selected. None if an infinite cycle could not be avoided.
+        * a flag for whether the selected node is terminal
+        * the list of the routing states associated with the nodes that were selected throughout the phase.
+            The first entry is the root state.
+        * the list of the actions associated with the actions that were needed to be selected to go from the parent
+            to the child node throughout the phase.
+            The first entry is a dummy value (0), so that the 2 lists are aligned.
+        """
         node = root
         path_states = [root.state]
         path_actions = [0]  # dummy 0 action to make the states dim and actions dim match (root does not need any action)
@@ -148,14 +205,52 @@ class MCTS:
         return node, True, path_states, path_actions
 
     def get_transposition(self, hash: int) -> Optional[Node]:
+        """
+        Given a hash of the state, retrieves the corresponding node if it is stored in the transposition table.
+        None if no such entry has been found.
+
+        A node with the same state can be reached in many distinct ways, this is called a transposition.
+
+        Parameters
+        ----------
+        hash - hash of the routing state
+
+        Returns
+        -------
+        A Node object if an entry was found.
+        None otherwise.
+        """
         if hash in self.transposition_table:
             return self.transposition_table[hash]
         return None
 
     def put_transposition(self, hash: int, node: Node) -> None:
+        """
+        Puts the given node into the transposition table.
+
+        Parameters
+        ----------
+        hash - hash of the state of the node
+        node - the node to put in the transposition table
+        """
         self.transposition_table[hash] = node
 
     def add_child(self, parent: Node, action: int | Tensor, child_state: RoutingState) -> Node:
+        """
+        Given a new child state, create a node with the state, and add it to the children of the parent node.
+        If a node with the associated state already exists in the transposition table,
+        it is retrieved instead of creating a new node, otherwise a new one is created.
+
+        Parameters
+        ----------
+        parent - parent of the node
+        action - action performed to arrive at the child state from the parent node
+        child_state - the child state to be encompassed into a node and added to the parent.children[action] table.
+
+        Returns
+        -------
+        The child Node object
+        """
         surpass_all_possible_gates(child_state)
         hash = gen_hash(child_state)
         node = self.get_transposition(hash)
@@ -166,7 +261,22 @@ class MCTS:
         parent.children[node] = action
         return node
 
-    def expand(self, leaf_node: Node) -> (Node, int):
+    def expand(self, leaf_node: Node) -> tuple[Node, int]:
+        """
+        Performs the expansion stage of the MCTS rollout.
+        Assumes the leaf node is not fully expanded, and expands it with one additional child node.
+        The order of expansion corresponds to the indices of the actions needed to reach the child node.
+
+        Parameters
+        ----------
+        leaf_node - leaf node to expand
+
+        Returns
+        -------
+        a tuple consisting of:
+        * the child node that expands the leaf node
+        * the index of the action needed to reach the child node
+        """
         used = set()
         for a in leaf_node.children.values():
             if isinstance(a, Tensor):
@@ -179,8 +289,6 @@ class MCTS:
             if a not in used:
                 action = a
                 break
-
-        # action = torch.tensor(len(leaf_node.children), dtype=int)
 
         state = deepcopy(leaf_node.state)
         if isinstance(action, Tensor):
@@ -196,16 +304,41 @@ class MCTS:
         return node, action
 
     def simulate(self, node: Node) -> Tensor:
+        """
+        Performs the simulation stage of the MCTS rollout.
+        Inputs the node to the transformer and outputs the transformer's evaluation of the state.
+
+        Parameters
+        ----------
+        node - the node to simulate
+
+        Returns
+        -------
+        The transformer's evaluation of the state.
+        """
         state = node.state
 
         embedding = embed_nodes(state, self.lookahead_length, self.device, self.qubit_embedding,
                                        self.embedding_dim, self.padding_dim).to(self.device)
-        _, _, _, _, state_eval = self.transformer(embedding.unsqueeze(0))
+        _, state_eval = self.transformer(embedding.unsqueeze(0))
 
 
         return state_eval
 
-    def backpropagate(self, path_states: list[RoutingState], path_actions: list[int], reward: Tensor):
+    def backpropagate(self, path_states: list[RoutingState], path_actions: list[int], reward: None | Tensor) -> None:
+        """
+        Performs the backpropagation stage of the MCTS rollout.
+        Goes back along the states visited, and updates node information
+        (node's value gets updated with the returns, node's visit counter gets incremented).
+
+        Parameters
+        ----------
+        path_states - the states visited throughout this MCTS rollout
+        path_actions - the actions chosen throughout this MCTS rollout
+        reward - the reward for this MCTS rollout.
+                Should be None for terminal nodes (we can compute exact reward then),
+                otherwise - the evaluation computed by the transformer.
+        """
         path_states.reverse()
         path_actions.reverse()
         if reward is None:
@@ -230,6 +363,19 @@ class MCTS:
                 returns += self.rewarder.compute_reward(old_state=path_states[i+1], new_state=path_states[i], action=action)
 
     def rollout(self, root: Node):
+        """
+        Performs one MCTS rollout on the root node and updates the node statistics.
+        (Selection -> Expansion -> Simulation -> Backpropagation)
+
+        Parameters
+        ----------
+        root - the root node of the search
+
+        Returns
+        -------
+        True if the selection phase resulted in an unavoidable infinite cycle.
+        False otherwise.
+        """
         leaf_node, is_terminal, path_states, path_actions = self.select(root)
         if leaf_node is None:
             self.add_child(self.get_transposition(gen_hash(path_states[-1])), path_actions[-1], root.state)
@@ -248,17 +394,36 @@ class MCTS:
 
         return False
 
-    def run(self, root_state: RoutingState | List[RoutingState], clear_tree: bool = False) -> (int, float, dict):
+    def run(self, root_state: RoutingState | List[RoutingState], clear_tree: bool = False) ->tuple[int, float]:
+        """
+        Runs the MCTS for the given root state(s).
+        Runs self.rollouts number of rollouts for each given root state.
+
+        Parameters
+        ----------
+        root_state - if a list of root states, the function runs recursively on each root state in the list.
+        clear_tree - if true, the transposition table is cleared
+
+        Returns
+        -------
+        a tuple consisting of:
+        * best action at the given root state
+        * evaluation of the given root state
+        """
         if clear_tree:
             self.transposition_table = dict()
 
         if isinstance(root_state, list):
+            start = time.time()
             best_actions = []
             state_evals = []
-            for state in root_state:
+            for i, state in enumerate(root_state):
+                print(f"MCTS processing state: {i}/{len(root_state)}")
                 action, eval = self.run(state)
                 best_actions.append(action)
                 state_evals.append(eval)
+            end = time.time()
+            print(f"MCTS rollouts total time: {end - start}")
 
             return best_actions, state_evals
 
@@ -273,19 +438,19 @@ class MCTS:
 
         # Should NOT happen
         if len(self.root.children) == 0:
-            return 0, 1, self.transposition_table
+            return 0, 1
 
+        # Maximize state value
         best_action = self.root.children[
             max(self.root.children.keys(), key=lambda child: child.value / (child.visits + 1e-6))]
+
+        # Maximize visit count
+        # best_action = self.root.children[
+        #     max(self.root.children.keys(), key=lambda child: child.visits)
+        # ]
+
         if isinstance(best_action, Tensor):
             best_action = best_action.item()
-
-        # state_evals = [0.0] * self.swap_options
-        # # print(f'len self.root.children.items() = {len(self.root.children.items())}')
-        # for child_node, action in self.root.children.items():  # child_node is Node, action is int or Tensor
-        #     act_idx = int(action.item()) if isinstance(action, torch.Tensor) else int(action)
-        #     # print(f'child node value: {child_node.value}')
-        #     state_evals[act_idx] = child_node.value / (child_node.visits + 1e-6)
 
         state_eval = self.root.value / (self.root.visits + 1e-6)
 
@@ -297,6 +462,13 @@ class MCTS:
 
         return best_action, state_eval
 
+### ###
+### THE CODE BELOW HAS NOT BEEN USED IN THE FINAL REPORT
+### PARALLEL MCTS SHOULD WORK IN THEORY
+### BUT AS IT IS NOW, THE OVERHEAD OF TRANSFERRING MODEL WEIGHTS BETWEEN PROCESSES
+### KILLS OFF ANY POTENTIAL THEORETICAL SPEEDUP
+### TODO: possible ways to fix it: look into optimizing IPC, or try newest Python versions that are smarter with the interpreter lock so that maybe you can do multithreading instead of multiprocessing
+### ###
 class MCTSWorker:
     def __init__(self, idx: int, qubit_embedding: nn.Embedding,
                  device: Device, swap_options: int, c: float = math.sqrt(2), rollouts: int = 200,
@@ -315,7 +487,6 @@ class MCTSWorker:
         self.inference_queue: mp.Queue | None = None
         self.output_queue: mp.Queue | None = None
         self.idx = idx
-        self.checkpoint_period = CHECKPOINT_PERIOD
         self.partial_rewarder = ManhattanRewarder(self.swap_options + 1)
 
         self.qubit_embedding.to(self.device)
@@ -554,27 +725,6 @@ def run_worker(worker: MCTSWorker, inference_queue: mp.Queue, output_queue: mp.Q
         print(f"Worker {worker.idx} with pid {os.getpid()} died. Exception {e} caught. {e.__traceback__}")
         return
 
-
-def get_action(node_embedding, transformer: Transformer, device: Device) -> (Tensor, Tensor):
-    """
-    Based on the current environment state, get an action suggested by the agent
-    :param node_embedding: Node embedding of the current state, should be an output of self.embed_nodes() right before this function
-    :return:
-        Action - tensor of the index of the swap option (last option is no swap)
-        log_prob - tensor of log probability of the action being optimal as predicted by the model
-    """
-    with autocast(device.type):
-        transformer_output = transformer(node_embedding)
-        swap_scores = transformer_output.sum(dim=1)
-        softmax_output = torch.softmax(swap_scores, dim=-1)
-        dist = torch.distributions.Categorical(probs=softmax_output, validate_args=False)
-
-        action = dist.sample()
-        log_prob: Tensor = dist.log_prob(action)
-
-    return action, log_prob
-
-
 def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: List[mp.Queue], transformer: Transformer):
     awaiting_states: List[Tuple[int, Embedding]] = []
     output_queues_states: List[bool] = [False] * len(output_queues)
@@ -615,7 +765,8 @@ def inference_loop(processes: int, inference_queue: mp.Queue, output_queues: Lis
         # print(f'embeddings: {embeddings}')
         # print(f'embedding: {embedding}')
         # actions, log_probs = get_action(embedding, transformer, device)
-        actions, _, _, _, state_values = transformer(embedding)
+        logits, state_values = transformer(embedding)
+        actions, _ = choose_actions(logits)
         # print(transformer.state_dict())
         # print(f'inferred state value: {state_values}')
 
@@ -718,6 +869,7 @@ class ParallelMCTS:
 
         evaluated_roots = []
 
+        start = time.time()
         for k in range((len(root_states) + self.processes - 1) // self.processes):
             print(f'MCTS loop iter: {k+1} / {(len(root_states) + self.processes - 1) // self.processes}...')
             while self.inference_queue.qsize() > 0:
@@ -743,6 +895,8 @@ class ParallelMCTS:
             if queue_loop.is_alive():
                 self.inference_queue.put(None)
                 queue_loop.join()
+        end = time.time()
+        print(f'MCTS rollouts total time: {end - start} seconds')
 
         actions = [a for a, _ in evaluated_roots]
         # state_values = [np.mean(v) for _, v in evaluated_roots]

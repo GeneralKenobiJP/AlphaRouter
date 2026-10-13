@@ -1,7 +1,7 @@
 import math
 
 import torch
-from torch import nn, Tensor
+from torch import nn, Tensor, argmax
 
 
 class PositionalEncoding(nn.Module):
@@ -21,18 +21,11 @@ class PositionalEncoding(nn.Module):
             torch.arange(0, embedding_dim, 2, dtype=torch.float32) * (-math.log(1e5) / embedding_dim))  # (d/2,)
         pe = torch.zeros(lookahead_length, embedding_dim)
         pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
 
-        # position = torch.arange(lookahead_length, dtype=torch.float32).unsqueeze(1)
-        # div_term = torch.exp(torch.arange(0, embedding_dim, 2, dtype=torch.float32) * (-math.log(1e5) / embedding_dim))
-        # pe = torch.zeros(lookahead_length, embedding_dim)
-        # pe[:, 0::2] = torch.sin(position * div_term)
-        #
-        # # Rounded up to the nearest even number so that odd indices slicing works
-        # final_embedding_dim_even = embedding_dim if embedding_dim % 2 == 0 else embedding_dim - 1
-        # pe[:, 1::2] = torch.cos(position * div_term[::final_embedding_dim_even])
-        # self.register_buffer('pe', pe)
+        odd_cols = pe[:, 1::2].shape[1]
+        if odd_cols > 0:
+            pe[:, 1::2] = torch.cos(position * div_term[:odd_cols])
+        self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -54,24 +47,25 @@ class TransformerLayer(nn.Module):
     - Feed-forward network
     - Add & norm layer
     """
-    def __init__(self, embedding_dim, num_heads, ffn_dim):
+    def __init__(self, d_model, num_heads, ffn_dim):
         """
-        :param embedding_dim: Embedding dimension of the node embeddings
+        :param d_model: internal feature width after input projection, d_model = num_heads * d_head
+            (embedding dimension for the multihead attention)
         :param num_heads: Number of heads in a multihead attention layer
         :param ffn_dim: Dimensionality of the hidden layer in the feed forward layer
         """
         super().__init__()
 
-        self.multihead_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
-        self.norm1 = nn.LayerNorm(embedding_dim)
+        self.multihead_attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(embedding_dim, ffn_dim),
+            nn.Linear(d_model, ffn_dim),
             nn.ReLU(),
-            nn.Linear(ffn_dim, embedding_dim)
+            nn.Linear(ffn_dim, d_model)
         )
-        self.norm2 = nn.LayerNorm(embedding_dim)
+        self.norm2 = nn.LayerNorm(d_model)
 
-    def forward(self, x):
+    def forward(self, x) -> Tensor:
         """
         Applies the transformer layer
         :param x: input tensor
@@ -83,22 +77,33 @@ class TransformerLayer(nn.Module):
         return x
 
 
-def choose_action(transformer_output) -> (Tensor, Tensor, Tensor, Tensor):
-    # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
+def choose_actions(logits: Tensor, sample: bool = True) -> tuple[Tensor, Tensor]:
+    """
+    Given logits and the policy choice (deterministic or probabilistic),
+    choose an action.
 
-    # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
-    # as we want to output the optimal swap action
-    swap_scores = transformer_output.mean(dim=1)
-    log_probs: Tensor = torch.log_softmax(swap_scores, dim=-1)
+    Parameters
+    ----------
+    logits
+    sample - if True, the action is sampled according to the distribution of the tensors (the sample is the index),
+            if False, always takes argmax
+
+    Returns
+    -------
+    An action chosen from the given logits.
+    """
+    # make_dot(transformer_output, params=dict(self.transformer.named_parameters())).render("graph", format='png')
+    log_probs: Tensor = torch.log_softmax(logits, dim=-1)
 
     log_probs = torch.nan_to_num(log_probs, nan=-1e-9, posinf=1e9, neginf=-1e9)
 
-    dist = torch.distributions.Categorical(logits=swap_scores, validate_args=False)
+    if sample:
+        dist = torch.distributions.Categorical(logits=logits, validate_args=False)
+        actions = dist.sample()
+    else:
+        actions = argmax(log_probs, dim=-1)
 
-    action = dist.sample()
-    action_log_prob: Tensor = dist.log_prob(action)
-
-    return action, action_log_prob, swap_scores, log_probs
+    return actions, log_probs
 
 
 class Transformer(nn.Module):
@@ -109,10 +114,12 @@ class Transformer(nn.Module):
         """
         :param embedding_dim: Embedding dimension of the node embeddings (with the padding and depth)
         :param num_heads: Number of heads in a multihead attention layer
+        :param d_model: internal feature width after input projection, d_model = num_heads * d_head
         :param ffn_dim: Dimensionality of the hidden layer in the feed forward layer
         :param num_layers: Number of transformer layers
         :param lookahead_length: The maximal number of the gates ahead that we will analyze
         :param swap_options: Number of possible swaps actions + 1 (to include no swap)
+        :param device: The device on which the model is run
         """
         super().__init__()
 
@@ -168,14 +175,11 @@ class Transformer(nn.Module):
         nn.init.zeros_(self.decoder.bias)
         nn.init.normal_(self.value_head.weight, 0.0, 1e-3)
 
-        # print(f'Transformer parameters initialised to {self.state_dict()}')
-
-    def forward(self, x):
+    def forward(self, x) -> Tensor:
         """
-        Pads the input accordingly, applies the transformer encoder and linear decoder
+        Applies the transformer encoder and linear decoder
         :param x: input tensor
         """
-        # with autocast(self.device.type):
         x = self.input_projection(x)
 
         x = self.positional_encoding(x)
@@ -188,4 +192,8 @@ class Transformer(nn.Module):
         state_values = state_values.squeeze(-1)
         state_values = state_values.mean(dim=1)
 
-        return *choose_action(output), state_values
+        # Transform the transformer output shape from (number_of_logical_gates x number_of_swap_options) to (number of swap_options)
+        # as we want to output the optimal swap action
+        logits = output.mean(dim=1)
+
+        return logits, state_values

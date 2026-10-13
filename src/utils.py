@@ -2,21 +2,27 @@ import bz2
 import datetime
 import gzip
 import lzma
+import os
 from collections import deque
 from pathlib import Path
 from sys import platform
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Any
 
 import numpy as np
 import torch
 from gymnasium import Wrapper
+from qgym.envs import Routing
 from qgym.envs.routing import RoutingState
-from torch import nn, Tensor
+from qgym.templates.state import ObservationT
+from torch import nn
 from torch.types import Device
 
 
 def _make_python_safe(obj):
-    """Convert common non-Python-native types into plain Python types."""
+    """
+    Convert common non-Python-native types into plain Python types.
+    This was needed for environments to work when they compute an information dict
+    """
     if obj is None:
         return None
     if isinstance(obj, deque):
@@ -58,6 +64,12 @@ class NormalizeInfoWrapper(Wrapper):
         # .env should exist because Wrapper provides it
         return getattr(self.env, '_state')
 
+    @_state.setter
+    def _state(self, value):
+        # delegate to inner env
+        # .env should exist because Wrapper provides it
+        setattr(self.env, '_state', value)
+
 
 def embed_nodes(state: RoutingState, lookahead_length: int, device: Device, qubit_embedding: nn.Embedding,
                 embedding_dim: int, padding_dim: int):
@@ -78,14 +90,6 @@ def embed_nodes(state: RoutingState, lookahead_length: int, device: Device, qubi
     :return: Node embedding
     """
     interaction_circuit = state.interaction_circuit[:lookahead_length]  # Limit lookahead depth
-
-    # w = getattr(qubit_embedding, "weight", None)
-    # print(f'qubit embedding weight: {w}')
-    # if w is not None:
-    #     try:
-    #         print(f"[weight device: {w.device}, shape: {w.shape}, sum: {float(w.sum()):.6f}")
-    #     except Exception as e:
-    #         print(f"could not inspect weight: {e}")
 
     # Pre-generate physical qubit embeddings
     phys_qubits = torch.arange(state.n_qubits, dtype=torch.long, device=device)
@@ -123,114 +127,6 @@ def embed_nodes(state: RoutingState, lookahead_length: int, device: Device, qubi
 
     return torch.stack(feature_matrix)
 
-def compute_returns(rewards, gamma=0.99):
-    """
-    Given a list of rewards [r0, r1, r2, …, r_{T-1}],
-    returns a list of discounted returns:
-      G_t = r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + …
-
-    Parameters
-    ----------
-    rewards: list of rewards collected in a given episode
-    gamma: float, discount factor.
-        The higher the gamma, the more important later rewards are.
-
-    Returns
-    -------
-    Discounted returns.
-    """
-    R = 0
-    returns = []
-    for r in reversed(rewards):
-        R = r + gamma * R
-        returns.insert(0, R)
-    returns = torch.tensor(returns)
-    # (Optionally) normalize returns to reduce variance:
-    # improves performance
-    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-    return returns
-
-def _pad_and_mask_rewards(reward_list: list[list[float]], device: Device) -> (Tensor, Tensor):
-    """
-    Pads the list of rewards and masks it.
-    The reward list is of shape (N_ENVS, #steps),
-    where #steps varies per env.
-    We want to pad it with zeros so that the shape becomes
-    (N_ENVS, limit of steps).
-
-    Additionally, we want to produce a mask that will show
-    which indices are just paddings, for future reference.
-
-    Parameters
-    ----------
-    reward_list: list of rewards collected in a given episode
-        Shape: (N_ENVS, #steps), where #steps varies per env
-
-    Returns
-    -------
-    A tuple of two elements:
-        - Padded reward list of shape(N_ENVS, limit of steps),
-        - Padding mask with 1 for each entry being an actual reward and 0 for a padding
-    """
-    size = len(reward_list)
-    max_length = max(len(rewards) for rewards in reward_list) if size > 0 else 0
-
-    padded_reward_list = torch.zeros((size, max_length), dtype=torch.float32, device=device)
-    mask = torch.zeros((size, max_length), dtype=torch.float32, device=device)
-
-    for i, rewards in enumerate(reward_list):
-        length = len(rewards)
-        if length == 0:
-            continue
-        padded_reward_list[i, :length] = torch.tensor(rewards, dtype=torch.float32, device=device)
-        mask[i, :length] = 1
-    return padded_reward_list, mask
-
-def compute_returns_batched(reward_list: list[list[float]], device: Device, gamma=0.99) -> (Tensor, Tensor):
-    """
-    Given a list of rewards [r0, r1, r2, …, r_{T-1}],
-    returns a list of discounted returns:
-      G_t = r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + …
-
-    Considers a full batch of rewards for multiple envs
-
-    Parameters
-    ----------
-    reward_list: list of rewards collected in a given episode
-        Shape: (N_ENVS, #steps), where #steps varies per env
-    device: PyTorch device, e.g. CPU or CUDA
-    gamma: float, discount factor.
-        The higher the gamma, the more important later rewards are.
-
-    Returns
-    -------
-    A tuple of two elements:
-        - Discounted returns.
-        - Padding mask with 1 for each entry being an actual reward and 0 for a padding.
-    """
-
-    padded_reward_list, mask = _pad_and_mask_rewards(reward_list, device)
-
-    batch_size, length = padded_reward_list.shape
-    returns = torch.zeros((batch_size, length), dtype=padded_reward_list.dtype, device=device)
-
-    R = torch.zeros(batch_size, dtype=padded_reward_list.dtype, device=device)
-
-    for i in range(length-1, -1, -1):
-        R = padded_reward_list[:, i] + gamma * R
-        R = R * mask[:, i]
-        returns[:, i] = R
-
-    # (Optionally) normalize returns to reduce variance:
-    # improves performance
-    valid = mask.bool()
-    vals = returns[valid]
-    mean = vals.mean()
-    std = vals.std(unbiased=False)
-    returns = (returns - mean) / (std + 1e-8)
-
-    return returns, mask
-
 def boost_process_priority():
     if platform == 'Windows':
         import win32api, win32process
@@ -238,6 +134,10 @@ def boost_process_priority():
         h = win32api.GetCurrentProcess()
         win32process.SetPriorityClass(h, win32process.REALTIME_PRIORITY_CLASS)
         win32process.SetThreadPriority(h, win32process.THREAD_PRIORITY_TIME_CRITICAL)
+
+def clear_terminal():
+    if platform == 'Windows':
+        os.system('cls')
 
 def compare_routing_states(state1: RoutingState, state2: RoutingState) -> bool:
     if not (isinstance(state1, RoutingState) and isinstance(state2, RoutingState)):
@@ -252,14 +152,26 @@ def compare_routing_states(state1: RoutingState, state2: RoutingState) -> bool:
     edges2 = set(state2.connection_graph.edges)
     if not edges1 == edges2:
         return False
-    if not state1.interaction_circuit[0] == state2.interaction_circuit[0]:
+    if not np.array_equal(state1.interaction_circuit[state1.position:], state2.interaction_circuit[state2.position:]):
         return False
     if not np.array_equal(state1.mapping, state2.mapping):
         return False
 
     return True
 
-def surpass_gate_if_possible(state: RoutingState):
+def surpass_gate_if_possible(state: RoutingState) -> bool:
+    """
+    For the given state, if the gate can be surpassed because its qubits are adjacent,
+    surpass the gate and alter the state accordingly.
+
+    Parameters
+    ----------
+    state - the RoutingState to check for possible surpassing
+
+    Returns
+    -------
+    True if a gate was surpassed, False otherwise (meaning the state is either done or no surpass is possible).
+    """
     if state.is_done():
         return False
 
@@ -270,8 +182,69 @@ def surpass_gate_if_possible(state: RoutingState):
     return False
 
 def surpass_all_possible_gates(state: RoutingState):
+    """
+    For the given state, surpass all possible gates that can be surpassed because their qubits are adjacent.
+    The state is altered so that it either is terminal or does not allow for further surpassing.
+
+    Parameters
+    ----------
+    state - the state to check for possible surpassing
+    """
     while surpass_gate_if_possible(state):
         pass
+
+def env_surpass_all_possible_gates(env: Routing):
+    """
+    For the state of the given routing environment, surpass all possible gates that can be surpassed because their qubits are adjacent.
+    The state is altered so that it either is terminal or does not allow for further surpassing.
+
+    Parameters
+    ----------
+    env - the environment whose state we want to check for possible surpassing
+    """
+    surpass_all_possible_gates(env._state)
+
+def env_surpass_all_possible_gates_with_info(env: Routing, surpass_action)\
+        -> tuple[ObservationT | None, float | None, bool, dict[Any, Any] | None]:
+    """
+    For the state of the given routing environment, surpass all possible gates that can be surpassed because their qubits are adjacent.
+    The state is altered so that it either is terminal or does not allow for further surpassing.
+
+    The surpassing is done via env.step() and so it produces all the transition information.
+    The function returns the information from the last surpass.
+
+    Parameters
+    ----------
+    env - the environment whose state we want to check for possible surpassing
+    surpass_action - the action index that causes the environment to surpass the gate (normally, the last possible action index)
+
+    Returns
+    -------
+    a tuple consisting of:
+    * observations
+    * reward
+    * done (terminated or truncated)
+    * info dict
+    None indicates that no surpass was possible or that the state is terminal.
+    """
+    state: RoutingState = env._state
+
+    if state.is_done():
+        return None, None, True, None
+
+    obs = None
+    rew = None
+    done = False
+    info = None
+
+    while state.is_legal_surpass(*state.interaction_circuit[state.position]):
+        obs, rew, ter, trun, inf = env.step(surpass_action)
+        done = ter or trun
+        if done:
+            return obs, rew, done, inf
+
+    return obs, rew, done, info
+
 
 def open_binary(path: Path, mode: str = 'rb', compress: Optional[str] = None):
     p = str(path)
@@ -285,25 +258,3 @@ def open_binary(path: Path, mode: str = 'rb', compress: Optional[str] = None):
 
 def get_timestamp():
     return str(datetime.datetime.now().isoformat()).replace(':', '-').replace('.', '-')
-
-# def _standard_reward(gates_routed: int, path_length: int) -> int:
-#     return gates_routed - path_length
-#
-# def standard_reward(path_states: list[RoutingState]) -> int:
-#     if len(path_states) <= 1:
-#         return 0
-#
-#     new_gates_routed = path_states[0].position - path_states[-1].position
-#
-#     return _standard_reward(new_gates_routed, len(path_states) - 1)
-#
-# def _ratio_reward(gates_routed: int, path_length: int) -> float:
-#     return gates_routed / path_length
-#
-# def ratio_reward(path_states: list[RoutingState]) -> float:
-#     if len(path_states) <= 1:
-#         return 0
-#
-#     new_gates_routed = path_states[0].position - path_states[-1].position
-#
-#     return _ratio_reward(new_gates_routed, len(path_states) - 1)

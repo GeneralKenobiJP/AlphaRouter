@@ -7,8 +7,9 @@ from typing import Sequence, Tuple, Union, Optional, Iterable, Any
 import math
 from collections import deque
 
+### Warning: Many of these functions have been vibecoded
 
-def plot(x_axis, values, label, xlabel, ylabel, title):
+def plot(x_axis, values, label, xlabel, ylabel, title, show=True, path=None):
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(x_axis, values, label=label, linewidth=2)
     ax.set_xlabel(xlabel)
@@ -17,7 +18,54 @@ def plot(x_axis, values, label, xlabel, ylabel, title):
     ax.legend()
     ax.grid(True)
     plt.tight_layout()
+    if path is not None:
+        plt.savefig(path)
+    if show:
+        plt.show()
+
+def plot_subplots(x_axis, values_lists, labels, linestyle, xlabel, ylabel, title):
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    for values, label in zip(values_lists, labels):
+        ax.plot(x_axis, values, label=label, linewidth=2, linestyle=linestyle)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
     plt.show()
+
+    return fig, ax
+
+
+def plot_subplots_2scales(x_axis, values_lists1, values_lists2, labels1, labels2, xlabel, ylabel1, ylabel2, title,
+                          show = True, path=None):
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    for values, label in zip(values_lists1, labels1):
+        ax.plot(x_axis, values, label=label, linewidth=2)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel1)
+    ax.set_title(title)
+
+    ax2 = ax.twinx()
+    for values, label in zip(values_lists2, labels2):
+        ax2.plot(x_axis, values, label=label, linewidth=2, linestyle='--', color='red')
+
+    ax2.set_ylabel(ylabel2)
+    ax2.legend()
+    ax.legend()
+    ax.grid(True)
+
+    plt.tight_layout()
+
+    if path is not None:
+        plt.savefig(path)
+    if show:
+        plt.show()
+
+    return fig, ax
 
 def moving_average(values, window):
     ma_values = []
@@ -444,3 +492,20 @@ def plot_mcts_tree(
     if show:
         plt.show()
     return fig
+
+
+def render_rgb(env, title=None, show=True, path=None):
+    """Convenience method that we will use later on to display our results. Copied from notebooks"""
+    if title is None:
+        title = f"Step {env._state.steps_done}"
+    plt.figure(figsize=(40, 20))
+    plt.title(title, fontsize=40)
+    try:
+        plt.imshow(env.render())
+    except IndexError:
+        plt.imshow(env.render())
+    plt.axis("off")
+    if path is not None:
+        plt.savefig(path)
+    if show:
+        plt.show()
