@@ -140,4 +140,7 @@ My sincere thanks to Dr. Sebastian Feld of TU Delft for his supervision, guidanc
 
 **GNU General Public License v3.0 (GPL-3.0).**
 
-> **TODO — add a `LICENSE` file containing the GPL-3.0 license text.**
+The GNU General Public License is a free, copyleft license for
+software and other kinds of works.
+
+See: [*LICENSE*](LICENSE)
