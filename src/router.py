@@ -797,9 +797,9 @@ class AlphaRouterAgent(nn.Module):
 
 
 if __name__ == '__main__':
-    print("Hello world")
+    # print("Hello world")
 
-    boost_process_priority()
+    # boost_process_priority()
 
     connection_graph = nx.Graph()
     connection_graph.add_edges_from([(0,1), (1,2), (2,3)])
@@ -838,7 +838,7 @@ if __name__ == '__main__':
                                                curriculum_generator=GateLengthCurriculumGenerator())
 
     start = time.time()
-    model.learn(1200, batch_size=64, curriculum_scheduler=curriculum_scheduler)
+    model.learn(128, batch_size=64, curriculum_scheduler=curriculum_scheduler)
     end = time.time()
     print(f'The training took: {end - start} seconds')
 

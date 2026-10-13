@@ -185,14 +185,14 @@ def train_single_config(config: dict[str, Any], device: str = "cpu") -> None:
             log_path=run_dir,
             episode_limit=120,
             wandb_run=run,
-            snapshots=False,
         )
 
         try:
             # curriculum = CurriculumScheduler(proceed_threshold=int(config["curriculum_proceed_threshold"]),
             #                                  retreat_threshold=int(config["curriculum_retreat_threshold"]),
             #                                  cooldown=20, max_level=10)
-            agent.learn(1200, batch_size=64, plot_graphs=True, show_circuits=False,
+            # todo: make timesteps a parameter
+            agent.learn(120, batch_size=64, plot_graphs=True, show_circuits=False,
                         save_model=True, curriculum_scheduler=None)
             add_logs_as_artifact(run, getattr(agent, "dir_path", None))
         finally:

@@ -116,10 +116,10 @@ def train(connection_graph, interaction_generator=None, device="cpu") -> None:
         agent = AlphaRouterAgent(connection_graph=connection_graph, interaction_generator=interaction_generator, device=device,
                                  embedding_dim=cfg.embedding_dim, num_heads=cfg.num_heads, d_model=d_model,
                                  ffn_dim=4*d_model, num_layers=cfg.num_layers, lookahead_length=cfg.lookahead_length, c_constant=cfg.c_constant,
-                                     lr=cfg.lr, log_path=run_dir, episode_limit=120,
-                                 wandb_run=run, snapshots=False)
+                                    lr=cfg.lr, log_path=run_dir, episode_limit=120, wandb_run=run)
 
-        agent.learn(30, batch_size=cfg.batch_size, plot_graphs=False, save_model=True, curriculum_scheduler=curriculum)
+        # todo: Make timesteps a parameter
+        agent.learn(32, batch_size=cfg.batch_size, plot_graphs=False, save_model=True, curriculum_scheduler=curriculum)
 
         artifact = wandb.Artifact(name="run_logs", type="logs")
         if agent.dir_path is not None:
